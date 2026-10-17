@@ -1,0 +1,516 @@
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { resolveHardTaskTimeoutMs } from '../orchestration/taskBudget.js';
+import { stageTimeoutMs } from '../agents/stageTimeouts.js';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import Database from 'better-sqlite3';
+import type { PipelineResult } from '../agents/pairPipeline.js';
+import type { TaskScheduler } from '../orchestration/taskScheduler.js';
+import type { TaskItem } from '../orchestration/decisionEngine.js';
+import type { AutonomousConfig } from './runnerTypes.js';
+import type { ITaskSource } from './taskSource.js';
+import { RETRY_RAMP_FROM_ATTEMPT } from './durableRunCoordinator.js';
+
+// Regression for INT-2010: adapter CLI/infra failures (the worker/reviewer never
+// ran) must NOT drive a completable issue to durable STUCK. They get a backoff
+// retry, like rate limits — not a logStuck.
+
+type AutonomousRunnerCtor = typeof import('./autonomousRunner.js').AutonomousRunner;
+type RunnerExecutionModule = typeof import('./runnerExecution.js');
+
+let tempDir = '';
+let AutonomousRunner: AutonomousRunnerCtor;
+let runnerExecution: RunnerExecutionModule;
+
+const cfg = (over: Partial<AutonomousConfig> = {}): AutonomousConfig => ({
+  linearTeamId: 'team',
+  allowedProjects: ['/repo'],
+  heartbeatSchedule: '0 * * * *',
+  autoExecute: false,
+  dryRun: true,
+  ...over,
+});
+
+const task = (): TaskItem => ({
+  id: 'task-1',
+  source: 'linear',
+  issueId: 'ISSUE-1',
+  issueIdentifier: 'INT-1',
+  title: 'Edit some files',
+  priority: 3,
+  createdAt: Date.now(),
+});
+
+const result = (finalStatus: PipelineResult['finalStatus']): PipelineResult => ({
+  success: false,
+  sessionId: 'pipeline-1',
+  iterations: 0,
+  totalDuration: 5,
+  finalStatus,
+  stages: [],
+  workerResult: { success: false, summary: '', filesChanged: [], commands: [], output: '', error: 'codex CLI failed with code 1' },
+});
+
+function mockTaskSource() {
+  return {
+    kind: 'local',
+    updateState: vi.fn(async () => true),
+    addComment: vi.fn(async () => {}),
+    logStuck: vi.fn(async () => {}),
+    logBlocked: vi.fn(async () => {}),
+  } as unknown as ITaskSource & {
+    updateState: ReturnType<typeof vi.fn>;
+    addComment: ReturnType<typeof vi.fn>;
+    logStuck: ReturnType<typeof vi.fn>;
+  };
+}
+
+async function runN(scheduler: TaskScheduler, finalStatus: PipelineResult['finalStatus'], n: number) {
+  for (let i = 0; i < n; i++) {
+    scheduler.startTask(task(), '/repo', async () => result(finalStatus));
+    await new Promise((resolve) => setTimeout(resolve, 15));
+  }
+}
+
+describe('AutonomousRunner infra_error handling (INT-2010)', () => {
+  beforeEach(async () => {
+    vi.resetModules();
+    tempDir = mkdtempSync(join(tmpdir(), 'openswarm-infra-'));
+    vi.stubEnv('OPENSWARM_TASK_STATE_FILE', join(tempDir, 'task-state.json')); // canonical store (taskState/store)
+    vi.stubEnv('OPENSWARM_RUNNER_TASK_STATE_FILE', join(tempDir, 'runner-task-state.json')); // legacy runnerState
+    vi.stubEnv('OPENSWARM_RUNNER_REJECTION_STATE_FILE', join(tempDir, 'runner-rejection-state.json'));
+    vi.stubEnv('OPENSWARM_RUNNER_PIPELINE_HISTORY_FILE', join(tempDir, 'runner-pipeline-history.json'));
+    vi.stubEnv('OPENSWARM_RUNNER_DECOMPOSITION_STATE_FILE', join(tempDir, 'runner-decomposition-state.json'));
+    ({ AutonomousRunner } = await import('./autonomousRunner.js'));
+    runnerExecution = await import('./runnerExecution.js');
+  }, 30000);
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('never marks STUCK even after many infra_error runs', async () => {
+    const source = mockTaskSource();
+    runnerExecution.setTaskSource(source);
+    const runner = new AutonomousRunner(cfg());
+    const scheduler = (runner as unknown as { scheduler: TaskScheduler }).scheduler;
+
+    await runN(scheduler, 'infra_error', 6); // well past MAX_RETRY_COUNT (4)
+
+    expect(source.logStuck).not.toHaveBeenCalled();
+    expect(source.updateState).not.toHaveBeenCalled(); // no failure-state sync
+    const history = JSON.parse(readFileSync(join(tempDir, 'runner-pipeline-history.json'), 'utf8'));
+    expect(history).toHaveLength(6);
+    expect(history.every((entry: { failureCause?: string }) => entry.failureCause === 'infra')).toBe(true);
+  });
+
+  it('retries a pair-level stuck result with fresh outer context before requiring a human', async () => {
+    const source = mockTaskSource();
+    runnerExecution.setTaskSource(source);
+    const runner = new AutonomousRunner(cfg());
+    const scheduler = (runner as unknown as { scheduler: TaskScheduler }).scheduler;
+    const stuck: PipelineResult = {
+      ...result('failed'),
+      failureSignal: 'stuck',
+      stuckReason: 'Same error repeated 3 times: schema validation failed',
+      taskContext: { issueIdentifier: 'INT-1', projectPath: '/repo', taskTitle: 'Edit some files' },
+    };
+
+    scheduler.startTask(task(), '/repo', async () => stuck);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    expect(source.logStuck).not.toHaveBeenCalled();
+    expect(source.updateState).toHaveBeenCalledWith('ISSUE-1', 'Todo');
+    const state = JSON.parse(readFileSync(join(tempDir, 'runner-task-state.json'), 'utf8'));
+    expect(state.failed['ISSUE-1']).toBe(1);
+    expect(state.retryTimes['ISSUE-1']).toBeGreaterThan(Date.now());
+  });
+
+  it('does not persist a superseded open issue as completed (INT-2568)', async () => {
+    const source = mockTaskSource();
+    runnerExecution.setTaskSource(source);
+    const runner = new AutonomousRunner(cfg());
+    const scheduler = (runner as unknown as { scheduler: TaskScheduler }).scheduler;
+    const superseded: PipelineResult = { ...result('superseded'), success: true };
+
+    scheduler.startTask(task(), '/repo', async () => superseded);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    const state = JSON.parse(readFileSync(join(tempDir, 'runner-task-state.json'), 'utf8'));
+    expect(state.completed).not.toContain('ISSUE-1');
+    expect(state.retryTimes['ISSUE-1']).toBeGreaterThan(Date.now());
+    expect(scheduler.getStats()).toMatchObject({ completed: 0, failed: 0 });
+    expect(source.updateState).not.toHaveBeenCalled();
+  });
+
+  it('still marks STUCK after MAX_RETRY_COUNT genuine failures (control)', async () => {
+    const source = mockTaskSource();
+    runnerExecution.setTaskSource(source);
+    const runner = new AutonomousRunner(cfg());
+    const scheduler = (runner as unknown as { scheduler: TaskScheduler }).scheduler;
+
+    await runN(scheduler, 'failed', 4);
+
+    expect(source.logStuck).toHaveBeenCalled();
+    expect(source.updateState).toHaveBeenCalledTimes(3); // retries only; terminal attempt is parked by logStuck
+  });
+
+  it('returns a retryable genuine failure to Todo immediately', async () => {
+    const source = mockTaskSource();
+    runnerExecution.setTaskSource(source);
+    const runner = new AutonomousRunner(cfg());
+    const scheduler = (runner as unknown as { scheduler: TaskScheduler }).scheduler;
+
+    await runN(scheduler, 'failed', 1);
+
+    expect(source.updateState).toHaveBeenCalledWith('ISSUE-1', 'Todo');
+  });
+
+  it('does not expose terminal failure synchronization as retryable Todo', async () => {
+    const source = mockTaskSource();
+    runnerExecution.setTaskSource(source);
+
+    await runnerExecution.syncFailureState(task(), 'terminal retries exhausted');
+
+    expect(source.updateState).not.toHaveBeenCalled();
+    expect(source.addComment).toHaveBeenCalled();
+  });
+
+  it('reports a refused Todo transition instead of claiming sync success', async () => {
+    const source = mockTaskSource();
+    source.updateState.mockResolvedValue(false);
+    runnerExecution.setTaskSource(source);
+
+    const synced = await runnerExecution.syncFailureState(task(), 'retryable failure', 'Todo');
+
+    expect(synced).toBe(false);
+    expect(source.updateState).toHaveBeenCalledWith('ISSUE-1', 'Todo');
+  });
+
+  it('records rate limits before the retry-hold early return', async () => {
+    const source = mockTaskSource();
+    runnerExecution.setTaskSource(source);
+    const runner = new AutonomousRunner(cfg());
+    const scheduler = (runner as unknown as { scheduler: TaskScheduler }).scheduler;
+
+    await runN(scheduler, 'rate_limited', 1);
+
+    const history = JSON.parse(readFileSync(join(tempDir, 'runner-pipeline-history.json'), 'utf8'));
+    expect(history).toHaveLength(1);
+    expect(history[0].failureCause).toBe('rate-limit');
+  });
+
+  // AGT-4430: the watchdog is derived from the iteration budget it guards, so
+  // this asserts the intent (a hung executor is recorded as a timeout) without
+  // re-encoding the old hard-coded hour that contradicted the 5-iteration cap.
+  it('records the scheduler hard watchdog as a timeout', async () => {
+    vi.useFakeTimers();
+    const dbPath = join(tempDir, 'automation.db');
+    const runner = new AutonomousRunner(cfg({
+      dryRun: false,
+      automationLedgerMode: 'primary',
+      automationDbPath: dbPath,
+    }));
+    const internal = runner as unknown as {
+      scheduler: TaskScheduler;
+      executeDurably: (task: TaskItem, projectPath: string, signal?: AbortSignal) => Promise<PipelineResult>;
+      executePipeline: () => Promise<PipelineResult>;
+    };
+    const scheduler = internal.scheduler;
+    const budgetMs = resolveHardTaskTimeoutMs({
+      maxIterations: 3,
+      workerTimeoutMs: stageTimeoutMs('worker', undefined),
+      otherStagesTimeoutMs: stageTimeoutMs('reviewer', undefined),
+    });
+
+    vi.spyOn(internal, 'executePipeline').mockImplementation(async () => await new Promise<PipelineResult>(() => {}));
+    const timedOutTask = task();
+    const startedAt = Date.now(); // fake clock
+    scheduler.startTask(timedOutTask, '/repo', (signal) => internal.executeDurably(timedOutTask, '/repo', signal));
+    // The durable claim is taken after real file I/O (repo metadata), which
+    // fake timers do not wait for. Advancing before it exists lets the
+    // watchdog fire on an unclaimed run, which records nothing — the flake
+    // behind AGT-4537. Wait for the claim, as a real run would have it.
+    const claims = (runner as unknown as { durableRuns: { activeClaims: Map<string, unknown> } }).durableRuns.activeClaims;
+    await vi.waitFor(() => expect(claims.has('ISSUE-1')).toBe(true), { timeout: 10_000, interval: 5 });
+    // waitFor advances the fake clock by its interval on every check.
+    await vi.advanceTimersByTimeAsync(budgetMs - 1 - (Date.now() - startedAt));
+    expect(existsSync(join(tempDir, 'runner-pipeline-history.json'))).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    const history = JSON.parse(readFileSync(join(tempDir, 'runner-pipeline-history.json'), 'utf8'));
+    expect(history).toHaveLength(1);
+    expect(history[0]).toMatchObject({ failureCause: 'timeout', finalStatus: 'infra_error' });
+    const reader = new Database(dbPath, { readonly: true });
+    try {
+      expect(reader.prepare('SELECT error_code, error_message FROM automation_attempts WHERE issue_id = ?').get('ISSUE-1'))
+        .toEqual({
+          error_code: 'watchdog_timeout',
+          error_message: `scheduler hard watchdog: budget ${Math.round(budgetMs / 60_000)}min (${budgetMs}ms), elapsed ${budgetMs}ms`,
+        });
+    } finally {
+      reader.close();
+    }
+  });
+});
+
+// AGT-4305: AGT-4257's idle_fill exists so free slots do not sit empty, but
+// bypassing the 1h infra_error backoff instantly and forever, on the SAME
+// issue, turns a transient provider hiccup into a worker+tester+reviewer
+// spend loop when that issue is the only candidate around to fill slots with
+// (observed on vela: AX-1272's reviewer call died to the same 360s OpenRouter
+// timeout 9 of ~13 attempts over 4h+, retried within ~90s every time).
+describe('idle-fill must not out-race a repeated infra_error on the same issue (AGT-4305)', () => {
+  type InternalRunner = {
+    scheduler: TaskScheduler;
+    filterAlreadyProcessed(tasks: TaskItem[]): TaskItem[];
+    consecutiveInfraErrorCounts: Map<string, number>;
+    failedTaskRetryTimes: Map<string, number>;
+  };
+
+  const backoffTask = (): TaskItem => ({
+    ...task(),
+    linearState: 'Todo',
+    linearProject: { id: 'project', name: 'Repo' },
+  });
+
+  it('still idle-fills through the real 1h backoff below the threshold (control, unchanged AGT-4257 behavior)', async () => {
+    const source = mockTaskSource();
+    runnerExecution.setTaskSource(source);
+    const runner = new AutonomousRunner(cfg()) as unknown as InternalRunner;
+
+    await runN(runner.scheduler, 'infra_error', 2); // below MAX_CONSECUTIVE_INFRA_IDLE_FILL (3)
+    expect(runner.failedTaskRetryTimes.get('ISSUE-1')).toBeGreaterThan(Date.now());
+
+    const filtered = runner.filterAlreadyProcessed([backoffTask()]);
+    expect(filtered.map((t) => t.issueId)).toContain('ISSUE-1');
+  });
+
+  it('stops bypassing the 1h backoff once the same issue has died to infra_error 3 times running', async () => {
+    const source = mockTaskSource();
+    runnerExecution.setTaskSource(source);
+    const runner = new AutonomousRunner(cfg()) as unknown as InternalRunner;
+
+    await runN(runner.scheduler, 'infra_error', 3);
+    expect(runner.consecutiveInfraErrorCounts.get('ISSUE-1')).toBe(3);
+    expect(runner.failedTaskRetryTimes.get('ISSUE-1')).toBeGreaterThan(Date.now());
+
+    const filtered = runner.filterAlreadyProcessed([backoffTask()]);
+    expect(filtered.map((t) => t.issueId)).not.toContain('ISSUE-1');
+  });
+
+  it('resets the streak once the same issue reaches a real (non-infra) outcome', async () => {
+    const source = mockTaskSource();
+    runnerExecution.setTaskSource(source);
+    const runner = new AutonomousRunner(cfg()) as unknown as InternalRunner;
+
+    await runN(runner.scheduler, 'infra_error', 3);
+    expect(runner.consecutiveInfraErrorCounts.get('ISSUE-1')).toBe(3);
+
+    const approved: PipelineResult = { ...result('approved'), success: true };
+    runner.scheduler.startTask(task(), '/repo', async () => approved);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    expect(runner.consecutiveInfraErrorCounts.has('ISSUE-1')).toBe(false);
+  });
+
+  // The gate above only fires through `legacyIsAuthority` — false whenever a
+  // durable run already exists and the ledger is primary. Any issue that has
+  // ever failed once already has a durable row, so the durable-ledger
+  // idle-fill branch (`idleLiftable`, separate code above) needed its own copy
+  // of this gate. Without it, this whole describe block would be green while
+  // the actual production incident (AX-1272, durable/primary ledger) kept
+  // looping — caught in independent review before this test existed.
+  it('the durable-ledger RETRY_AT idle-fill branch also stops bypassing backoff after 3 consecutive infra_errors', async () => {
+    const LEDGER_TASK: TaskItem = {
+      id: 'ISSUE-1', issueId: 'ISSUE-1', issueIdentifier: 'ISSUE-1',
+      source: 'linear', title: 'reviewer keeps timing out', priority: 2, createdAt: 0,
+      linearState: 'Todo', linearProject: { id: 'project', name: 'Repo' },
+    };
+    const dbPath = join(tempDir, 'automation.db');
+
+    const source = mockTaskSource();
+    runnerExecution.setTaskSource(source);
+    const runner = new AutonomousRunner(cfg({ automationLedgerMode: 'primary', automationDbPath: dbPath })) as unknown as InternalRunner & {
+      durableRuns: {
+        observeTask(task: TaskItem, repo: string): void;
+        getRun(id: string): { state: string } | null;
+        close(): void;
+      };
+    };
+    runner.durableRuns.observeTask(LEDGER_TASK, '/repo');
+
+    // Build the legacy-tracked streak the same way production does (the
+    // increment itself is unconditional — see the 'failed' handler).
+    await runN(runner.scheduler, 'infra_error', 3);
+    expect(runner.consecutiveInfraErrorCounts.get('ISSUE-1')).toBe(3);
+
+    // Seed the durable row into RETRY_AT with a future retryAt, the way the
+    // real infra_error ledger transition leaves it (durableRunCoordinator.ts).
+    const { RunLedger } = await import('./runLedger.js');
+    const ledger = new RunLedger(dbPath);
+    const claim = ledger.claimRun('ISSUE-1', { ownerInstanceId: 'seed', leaseMs: 60_000, maxActiveForProject: 1 });
+    expect(claim).not.toBeNull();
+    expect(ledger.transition(claim!, 'RETRY_AT', {
+      retryAt: Date.now() + 3_600_000, errorCode: 'infra_error',
+    })).toBe(true);
+    ledger.close();
+
+    const filtered = runner.filterAlreadyProcessed([LEDGER_TASK]);
+    expect(filtered.map((t) => t.issueId)).not.toContain('ISSUE-1');
+    expect(runner.durableRuns.getRun('ISSUE-1')?.state).toBe('RETRY_AT'); // still parked, not lifted
+
+    runner.durableRuns.close(); // this test opens its own primary-mode ledger handle
+  });
+
+  // AGT-4036: a supersession backoff waits for the PR that owns the files to
+  // close. Idle fill lifted it every heartbeat, so the drafter re-ran against
+  // the same open PR 25 s apart — AX-1481 reached attempt #415 on 2026-09-17.
+  it('the durable-ledger RETRY_AT idle-fill branch leaves a supersession backoff alone', async () => {
+    const LEDGER_TASK: TaskItem = {
+      id: 'ISSUE-1', issueId: 'ISSUE-1', issueIdentifier: 'ISSUE-1',
+      source: 'linear', title: 'files owned by an open PR', priority: 2, createdAt: 0,
+      linearState: 'Todo', linearProject: { id: 'project', name: 'Repo' },
+    };
+    const dbPath = join(tempDir, 'automation-superseded.db');
+    const source = mockTaskSource();
+    runnerExecution.setTaskSource(source);
+    const runner = new AutonomousRunner(cfg({ automationLedgerMode: 'primary', automationDbPath: dbPath })) as unknown as InternalRunner & {
+      durableRuns: { observeTask(task: TaskItem, repo: string): void; getRun(id: string): { state: string } | null; close(): void };
+    };
+    runner.durableRuns.observeTask(LEDGER_TASK, '/repo');
+
+    const { RunLedger } = await import('./runLedger.js');
+    const ledger = new RunLedger(dbPath);
+    const claim = ledger.claimRun('ISSUE-1', { ownerInstanceId: 'seed', leaseMs: 60_000, maxActiveForProject: 1 });
+    expect(claim).not.toBeNull();
+    // The way durableRunCoordinator leaves a superseded result: RETRY_AT with the supersession backoff.
+    expect(ledger.transition(claim!, 'RETRY_AT', { retryAt: Date.now() + 5 * 60_000, errorCode: 'superseded' })).toBe(true);
+    // Control: the same row parked for an ordinary rejection IS lifted by idle fill.
+    ledger.close();
+
+    const filtered = runner.filterAlreadyProcessed([LEDGER_TASK]);
+    expect(filtered.map((t) => t.issueId)).not.toContain('ISSUE-1');
+    expect(runner.durableRuns.getRun('ISSUE-1')?.state).toBe('RETRY_AT');
+
+    runner.durableRuns.close();
+  });
+
+  it('the durable-ledger RETRY_AT idle-fill branch still lifts an ordinary rejection backoff (control)', async () => {
+    const LEDGER_TASK: TaskItem = {
+      id: 'ISSUE-1', issueId: 'ISSUE-1', issueIdentifier: 'ISSUE-1',
+      source: 'linear', title: 'rejected once', priority: 2, createdAt: 0,
+      linearState: 'Todo', linearProject: { id: 'project', name: 'Repo' },
+    };
+    const dbPath = join(tempDir, 'automation-rejected.db');
+    const source = mockTaskSource();
+    runnerExecution.setTaskSource(source);
+    const runner = new AutonomousRunner(cfg({ automationLedgerMode: 'primary', automationDbPath: dbPath })) as unknown as InternalRunner & {
+      durableRuns: { observeTask(task: TaskItem, repo: string): void; getRun(id: string): { state: string } | null; close(): void };
+    };
+    runner.durableRuns.observeTask(LEDGER_TASK, '/repo');
+
+    const { RunLedger } = await import('./runLedger.js');
+    const ledger = new RunLedger(dbPath);
+    const claim = ledger.claimRun('ISSUE-1', { ownerInstanceId: 'seed', leaseMs: 60_000, maxActiveForProject: 1 });
+    expect(ledger.transition(claim!, 'RETRY_AT', { retryAt: Date.now() + 30 * 60_000, errorCode: 'rejected' })).toBe(true);
+    ledger.close();
+
+    const filtered = runner.filterAlreadyProcessed([LEDGER_TASK]);
+    expect(filtered.map((t) => t.issueId)).toContain('ISSUE-1');
+    expect(runner.durableRuns.getRun('ISSUE-1')?.state).toBe('READY');
+
+    runner.durableRuns.close();
+  });
+
+  // AGT-4675: the retry ramp (AGT-4673) only holds if idle fill leaves a run on it alone.
+  // AX-1844 failed its 8th attempt, was backed off, and was lifted to READY seven seconds
+  // later because a slot was free, ahead of 36 READY tasks.
+  async function runnerWithFailedAttempts(attempts: number): Promise<{
+    runner: InternalRunner & { durableRuns: { getRun(id: string): { state: string; attemptNo: number } | null; close(): void } };
+    task: TaskItem;
+  }> {
+    const task: TaskItem = {
+      id: 'ISSUE-1', issueId: 'ISSUE-1', issueIdentifier: 'ISSUE-1',
+      source: 'linear', title: `failed ${attempts} times`, priority: 1, createdAt: 0,
+      linearState: 'Todo', linearProject: { id: 'project', name: 'Repo' },
+    };
+    const dbPath = join(tempDir, `automation-ramp-${attempts}.db`);
+    runnerExecution.setTaskSource(mockTaskSource());
+    const runner = new AutonomousRunner(cfg({ automationLedgerMode: 'primary', automationDbPath: dbPath })) as unknown as InternalRunner & {
+      durableRuns: { observeTask(task: TaskItem, repo: string): void; getRun(id: string): { state: string; attemptNo: number } | null; close(): void };
+    };
+    runner.durableRuns.observeTask(task, '/repo');
+
+    const { RunLedger } = await import('./runLedger.js');
+    const ledger = new RunLedger(dbPath);
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      const claim = ledger.claimRun('ISSUE-1', { ownerInstanceId: 'seed', leaseMs: 60_000, maxActiveForProject: 1 });
+      expect(claim).not.toBeNull();
+      // Earlier attempts are already due; the last one is still backed off.
+      const retryAt = attempt < attempts ? Date.now() - 1_000 : Date.now() + 6 * 60 * 60_000;
+      expect(ledger.transition(claim!, 'RETRY_AT', { retryAt, errorCode: 'failed' })).toBe(true);
+    }
+    ledger.close();
+    return { runner, task };
+  }
+
+  it('idle fill leaves a run alone once its retry delay has started to double (AGT-4675)', async () => {
+    const { runner, task } = await runnerWithFailedAttempts(RETRY_RAMP_FROM_ATTEMPT);
+    expect(runner.durableRuns.getRun('ISSUE-1')?.attemptNo).toBe(RETRY_RAMP_FROM_ATTEMPT);
+
+    const filtered = runner.filterAlreadyProcessed([task]);
+    expect(filtered.map((t) => t.issueId)).not.toContain('ISSUE-1');
+    expect(runner.durableRuns.getRun('ISSUE-1')?.state).toBe('RETRY_AT');
+    runner.durableRuns.close();
+  });
+
+  it('idle fill still lifts a run one attempt before the ramp (control, AGT-4675)', async () => {
+    const { runner, task } = await runnerWithFailedAttempts(RETRY_RAMP_FROM_ATTEMPT - 1);
+    expect(runner.durableRuns.getRun('ISSUE-1')?.attemptNo).toBe(RETRY_RAMP_FROM_ATTEMPT - 1);
+
+    const filtered = runner.filterAlreadyProcessed([task]);
+    expect(filtered.map((t) => t.issueId)).toContain('ISSUE-1');
+    expect(runner.durableRuns.getRun('ISSUE-1')?.state).toBe('READY');
+    runner.durableRuns.close();
+  });
+
+  // AGT-4307: a pipeline that THROWS reaches the runner through the
+  // scheduler's 'error' event, not 'failed'. The ledger already records that
+  // as infra_error; the in-memory streak did not, so the gate above never saw
+  // it and idle fill lifted the 15-minute park every heartbeat.
+  it('a thrown executor counts toward the same infra streak, and the durable gate holds it after 3', async () => {
+    const LEDGER_TASK: TaskItem = {
+      id: 'ISSUE-1', issueId: 'ISSUE-1', issueIdentifier: 'ISSUE-1',
+      source: 'linear', title: 'adapter keeps throwing', priority: 2, createdAt: 0,
+      linearState: 'Todo', linearProject: { id: 'project', name: 'Repo' },
+    };
+    const dbPath = join(tempDir, 'automation-thrown.db');
+    const source = mockTaskSource();
+    runnerExecution.setTaskSource(source);
+    const runner = new AutonomousRunner(cfg({ automationLedgerMode: 'primary', automationDbPath: dbPath })) as unknown as InternalRunner & {
+      durableRuns: { observeTask(task: TaskItem, repo: string): void; getRun(id: string): { state: string; lastErrorCode?: string } | null; close(): void };
+    };
+    runner.durableRuns.observeTask(LEDGER_TASK, '/repo');
+
+    for (let i = 0; i < 3; i++) {
+      runner.scheduler.startTask(task(), '/repo', async () => { throw new Error('openrouter timeout after 360000ms'); });
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+    expect(runner.consecutiveInfraErrorCounts.get('ISSUE-1')).toBe(3);
+
+    // The row the coordinator leaves behind a throw: RETRY_AT, 15 min, labelled infra_error.
+    const { RunLedger } = await import('./runLedger.js');
+    const ledger = new RunLedger(dbPath);
+    const claim = ledger.claimRun('ISSUE-1', { ownerInstanceId: 'seed', leaseMs: 60_000, maxActiveForProject: 1 });
+    expect(ledger.transition(claim!, 'RETRY_AT', { retryAt: Date.now() + 15 * 60_000, errorCode: 'infra_error' })).toBe(true);
+    ledger.close();
+
+    expect(runner.filterAlreadyProcessed([LEDGER_TASK]).map((t) => t.issueId)).not.toContain('ISSUE-1');
+    expect(runner.durableRuns.getRun('ISSUE-1')?.state).toBe('RETRY_AT');
+    runner.durableRuns.close();
+  });
+});

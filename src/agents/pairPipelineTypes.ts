@@ -1,0 +1,220 @@
+import type { TaskItem } from '../orchestration/decisionEngine.js';
+import type { PipelineStage, RoleConfig, PipelineGuardsConfig, JobProfile, SecurityAuditConfig, VerifyConfig } from '../core/types.js';
+import type { CostInfo } from '../support/costTracker.js';
+import type { WorkerResult, ReviewResult, PairSession } from './agentPair.js';
+import type { TesterResult } from './tester.js';
+import type { DocumenterResult } from './documenter.js';
+import type { AuditorResult } from './auditor.js';
+import type { SkillDocumenterResult } from './skillDocumenter.js';
+import type { GuardsRunResult } from './pipelineGuards.js';
+import type { ReflectionState } from './reflection.js';
+import type { WorkerFanoutGateDecision } from './workerFanoutGate.js';
+import type { VerifyCommand } from '../verify/manifest.js';
+import type { ToolDefinition } from '../adapters/tools.js';
+import type { AdapterRoutePolicy } from '../coordination/routingPolicy.js';
+import type { InstructionCapsule } from './instructionCapsule.js';
+
+export interface PipelineRunMetadata {
+  repository?: string;
+  projectPath?: string;
+  /** Canonical main-checkout path used by the coordination board. */
+  coordinationRepository?: string;
+  /** Opaque repository-cell identity shared by sibling worktrees. */
+  repoKey?: string;
+  worktree?: string;
+  branch?: string;
+  issueIdentifier?: string;
+  title?: string;
+}
+
+export interface PipelineConfig {
+  stages: PipelineStage[];
+  continueOnTestFail?: boolean;
+  skipDocumenterIfNoChange?: boolean;
+  maxIterations?: number;
+  /**
+   * Wall-clock budget for the whole task — the SAME number the scheduler's
+   * watchdog uses (resolveHardTaskTimeoutMs). The loop stops before it rather
+   * than being killed mid-iteration (AGT-4430).
+   */
+  taskBudgetMs?: number;
+  maxReflections?: number;
+  roles?: {
+    worker?: RoleConfig;
+    reviewer?: RoleConfig;
+    tester?: RoleConfig;
+    documenter?: RoleConfig;
+    auditor?: RoleConfig;
+    'skill-documenter'?: RoleConfig;
+  };
+  guards?: Partial<PipelineGuardsConfig>;
+  verify?: VerifyConfig;
+  securityAudit?: SecurityAuditConfig;
+  jobProfiles?: JobProfile[];
+  runMetadata?: PipelineRunMetadata;
+  skipTesterIfNoCodeChange?: boolean;
+  skipAuditorUnderFileCount?: number;
+  verbose?: boolean;
+  /** Task-owned files already committed in a preserved WIP chain before this run. */
+  resumedTaskFiles?: string[];
+  /** Claude Code instructions/runbooks captured before the run starts. */
+  instructionCapsule?: InstructionCapsule;
+  /** The project's standing goal; the worker and reviewer prompts carry it (AGT-4662). */
+  projectGoal?: string;
+  roleMcpTools?: { worker?: ToolDefinition[]; reviewer?: ToolDefinition[] };
+  adapterRouting?: AdapterRoutePolicy;
+  /** OS fence for the worker's bash tool (autonomous.workerSandbox). Unset = off, as before AGT-4387. */
+  workerSandbox?: 'on' | 'off';
+  draftAnalysis?: {
+    taskType: string;
+    intentSummary: string;
+    relevantFiles: string[];
+    suggestedApproach: string;
+    projectStats?: string;
+    completionCriteria?: string[];
+    sufficient?: boolean;
+    impactAnalysis?: import('../knowledge/types.js').ImpactAnalysis;
+    registrySnapshot?: Array<{ filePath: string; summary: string; highlights: string[] }>;
+  };
+}
+
+export interface StageResult {
+  stage: PipelineStage;
+  success: boolean;
+  result: WorkerResult | ReviewResult | TesterResult | DocumenterResult | AuditorResult | SkillDocumenterResult | { success: false; error: string };
+  duration: number;
+  startedAt: number;
+  completedAt: number;
+}
+
+export interface PipelineResult {
+  success: boolean;
+  sessionId: string;
+  stages: StageResult[];
+  /**
+   * Non-blocking guard warnings from the final guards run, kept so the
+   * durable record answers "what did the guards object to?" without a
+   * reviewer and without re-running them (AGT-4439).
+   */
+  guardWarnings?: import('./guardWarningRecord.js').GuardWarningRecord[];
+  finalStatus: 'approved' | 'rejected' | 'failed' | 'cancelled' | 'decomposed' | 'superseded' | 'deferred' | 'rate_limited' | 'infra_error' | 'waiting_on_operator';
+  /**
+   * Set only when `finalStatus === 'infra_error'` and the cause is the
+   * repository itself (disk full, `.git` lock, corrupt repo — a failed
+   * `git worktree add`), not an adapter timeout, tooling failure, or network
+   * blip. The repository failure circuit reads this to count only the former:
+   * an adapter retrying on a fixed clock is not the repository failing, and
+   * lumping the two together can close a healthy repository to every other
+   * task over transient LLM/network noise (AGT-4038).
+   */
+  repositoryInfra?: boolean;
+  failureSignal?: 'gate-fail' | 'timeout' | 'stuck';
+  stuckReason?: string;
+  rateLimitResetsAt?: number;
+  /** Earliest epoch-ms at which a transiently deferred run may be retried. */
+  retryAt?: number;
+  totalDuration: number;
+  iterations: number;
+  workerResult?: WorkerResult;
+  reviewResult?: ReviewResult;
+  /** The last REAL reviewer revise feedback. `reviewResult` can end up holding a
+   *  synthetic entry (validation nudge / HALT overwrite it), which made failed
+   *  sessions persist "Unknown error"-grade detail for the retry (INT-2504). */
+  lastReviewFeedback?: string;
+  testerResult?: TesterResult;
+  documenterResult?: DocumenterResult;
+  auditorResult?: AuditorResult;
+  skillDocumenterResult?: SkillDocumenterResult;
+  taskContext?: {
+    issueIdentifier?: string;
+    projectName?: string;
+    projectPath?: string;
+    taskTitle?: string;
+  };
+  prUrl?: string;
+  totalCost?: CostInfo;
+  /**
+   * Operation/stage and original cause of the terminal failure, including
+   * thrown pipeline errors, worktree setup, durable fences and publication.
+   * Takes precedence over prior stage feedback in the failure ledger.
+   */
+  failureDetail?: string;
+  /**
+   * A deterministic failure that an operator has to resolve. The coordinator
+   * parks the run as NEEDS_HUMAN under `code` instead of scheduling a retry:
+   * the publication-scope fence rejecting files already committed on the
+   * branch cannot be retried into success, and vela spent 23/48/15 attempts
+   * on three such runs on 2026-09-02 before anyone looked.
+   */
+  operatorPark?: { code: string; reason: string };
+  /** Deterministic coordinator action applied before durable park/complete. */
+  coordinatorResolution?: { action: 'complete' | 'retry'; reason: string };
+}
+
+/**
+ * NEEDS_HUMAN code for a worker that delivered no edits — either with an
+ * explicit `noChangesReason` (publication then has nothing to open a PR from)
+ * or by repeating the empty-result contract violation until the session gave
+ * up. Both mean the same thing to an operator: the agent will not produce a
+ * diff for this issue as written.
+ */
+export const WORKER_NO_CHANGES_PARK_REASON = 'worker_no_changes';
+/** Publication-path park: the worker stated why no source edit was required. */
+export const WORKER_NO_CHANGES_STATEMENT_PREFIX = 'Worker finished without edits:';
+/** NEEDS_HUMAN code for a no-edit stop whose reason the reviewer confirmed (AGT-4535). */
+export const VERIFIED_WORKER_BLOCKER_PARK_REASON = 'verified_worker_blocker';
+
+export interface PipelineContext {
+  task: TaskItem;
+  projectPath: string;
+  session: PairSession;
+  config: PipelineConfig;
+  currentIteration: number;
+  taskPrefix: string;
+  workerResult?: WorkerResult;
+  reviewResult?: ReviewResult;
+  testerResult?: TesterResult;
+  documenterResult?: DocumenterResult;
+  auditorResult?: AuditorResult;
+  skillDocumenterResult?: SkillDocumenterResult;
+  guardsResult?: GuardsRunResult;
+  reflection: ReflectionState;
+  feedbackSource?: 'objective' | 'review';
+  workerFanoutDecision?: WorkerFanoutGateDecision;
+  /** Feedback of the previous reviewer 'revise' — compared against the next one to detect a repeating reviewer (INT-2474). */
+  lastReviseFeedback?: string;
+  /** One-shot worker escalation triggered by repeated similar revise feedback: higher model and/or effort for the retry (INT-2475). */
+  workerEscalation?: { model?: string; reasoningEffort?: 'low' | 'medium' | 'high' };
+  /** The missing-validation-evidence gate has already nudged once this session — after that it defers to the reviewer instead of consuming more iterations (INT-2485). */
+  validationNudged?: boolean;
+  /** Commands captured before the worker runs, preventing self-modification of the verification gate. */
+  trustedVerifyCommands?: VerifyCommand[];
+  trustedVerifyPackageJsonByDirectory?: Record<string, string>;
+  trustedVerifyInputFingerprint?: string;
+  /** Deferred capture error so invalid manifests retain tester-stage failure semantics. */
+  trustedVerifyError?: unknown;
+  securityBaseline?: import('../verify/securityAudit.js').SecurityAuditResult;
+  newSecurityFindings?: import('../verify/securityAudit.js').SecurityFinding[];
+  /** Pair-level stagnation detector reason, preserved so the scheduler does not rerun the same loop. */
+  stuckReason?: string;
+  /** Wall-clock budget spent before another iteration could fit (AGT-4430). */
+  budgetParkReason?: string;
+  /** Per-iteration worktree snapshots and whether this run has already rolled back (AGT-4460). */
+  snapshots?: import('./iterationSnapshot.js').IterationSnapshotState;
+  /** Git tree the run started from; see captureRunStart (AGT-4534). */
+  runSnapshotHash?: string;
+  /** Same out-of-scope write rejected twice: retrying cannot alter the fence. */
+  repeatedScopeRejection?: string;
+  /** A no-edit worker blocker claim has been put to the reviewer this run (AGT-4535). */
+  blockerReviewed?: boolean;
+  /** The worker's blocker claim plus the reviewer's confirming evidence. */
+  verifiedBlocker?: string;
+  /** The reviewer's verdict on a blocker claim, kept for cost accounting. */
+  blockerReview?: ReviewResult;
+  /** Abort signal for this run — set per run() so concurrent runs do not share it. */
+  abortSignal?: AbortSignal;
+  /** Per-run stuck detector — never share across concurrent run() calls. */
+  stuckDetector?: import('../support/stuckDetector.js').StuckDetector;
+}
+
+export type PipelineEventType = 'stage:start' | 'stage:complete' | 'stage:fail' | 'iteration:start' | 'iteration:complete' | 'iteration:fail' | 'pipeline:complete' | 'pipeline:fail' | 'fanout:gate' | 'halt';

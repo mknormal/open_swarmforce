@@ -1,0 +1,127 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+// Same promisify.custom technique as prProcessor.test.ts: execFileAsync
+// destructures {stdout}, so the mock must control that exact shape rather
+// than rely on generic callback-to-promise conversion.
+const { execImpl } = vi.hoisted(() => ({
+  execImpl: vi.fn(async (_cmd: string, _args: string[], _opts?: Record<string, unknown>) => ({ stdout: '', stderr: '' })),
+}));
+
+vi.mock('node:child_process', () => {
+  const CUSTOM = Symbol.for('nodejs.util.promisify.custom');
+  function execFile() { throw new Error('execFile called without promisify in test'); }
+  (execFile as unknown as Record<symbol, unknown>)[CUSTOM] = (cmd: string, args: string[], opts?: Record<string, unknown>) => execImpl(cmd, args, opts);
+  return { execFile };
+});
+
+const { parsePRRef, resolveRepoName, resolveOriginRepo, resolvePR, toPRInfo } = await import('./prResolve.js');
+
+beforeEach(() => {
+  execImpl.mockReset();
+});
+
+describe('parsePRRef (INT-3282)', () => {
+  it('parses owner/repo#n', () => {
+    expect(parsePRRef('o/r#42')).toEqual({ repo: 'o/r', number: 42 });
+  });
+  it('parses #n and bare n', () => {
+    expect(parsePRRef('#7')).toEqual({ number: 7 });
+    expect(parsePRRef('7')).toEqual({ number: 7 });
+  });
+  it('rejects garbage', () => {
+    expect(() => parsePRRef('not-a-ref')).toThrow(/Invalid PR ref/);
+  });
+});
+
+describe('resolveRepoName (INT-3282)', () => {
+  it('returns the explicit repo without shelling out when it already has a slash', async () => {
+    const result = await resolveRepoName('/tmp/proj', 'o/r');
+    expect(result).toBe('o/r');
+    expect(execImpl).not.toHaveBeenCalled();
+  });
+
+  it('infers the repo via gh repo view when no explicit repo is given', async () => {
+    execImpl.mockResolvedValueOnce({ stdout: 'o/r\n', stderr: '' });
+    const result = await resolveRepoName('/tmp/proj');
+    expect(result).toBe('o/r');
+    expect(execImpl).toHaveBeenCalledWith('gh', expect.arrayContaining(['repo', 'view']), expect.objectContaining({ timeout: expect.any(Number) }));
+  });
+
+  it('throws when gh returns something without a slash', async () => {
+    execImpl.mockResolvedValueOnce({ stdout: 'garbage\n', stderr: '' });
+    await expect(resolveRepoName('/tmp/proj')).rejects.toThrow(/Could not resolve repository name/);
+  });
+});
+
+describe('resolveOriginRepo (INT-3282)', () => {
+  it('hands origin\'s own URL to gh repo view, not a bare gh repo view', async () => {
+    execImpl
+      .mockResolvedValueOnce({ stdout: 'https://github.com/o/r.git\n', stderr: '' }) // git remote get-url origin
+      .mockResolvedValueOnce({ stdout: 'o/r\n', stderr: '' }); // gh repo view <url>
+    const result = await resolveOriginRepo('/tmp/proj');
+    expect(result).toBe('o/r');
+    expect(execImpl).toHaveBeenCalledWith('git', ['remote', 'get-url', 'origin'], expect.objectContaining({ timeout: expect.any(Number) }));
+    expect(execImpl).toHaveBeenCalledWith('gh', expect.arrayContaining(['repo', 'view', 'https://github.com/o/r.git']), expect.objectContaining({ timeout: expect.any(Number) }));
+  });
+
+  it('throws when gh returns something without a slash for the origin URL', async () => {
+    execImpl
+      .mockResolvedValueOnce({ stdout: 'https://github.com/o/r.git\n', stderr: '' })
+      .mockResolvedValueOnce({ stdout: 'garbage\n', stderr: '' });
+    await expect(resolveOriginRepo('/tmp/proj')).rejects.toThrow(/Could not resolve repository name for origin/);
+  });
+
+  it('propagates a failure to determine origin\'s URL', async () => {
+    execImpl.mockRejectedValueOnce(new Error('fatal: No such remote \'origin\''));
+    await expect(resolveOriginRepo('/tmp/proj')).rejects.toThrow(/No such remote/);
+  });
+});
+
+describe('resolvePR (INT-3282)', () => {
+  const ghView = { number: 9, title: 'Ship it', headRefName: 'feat/x', url: 'https://example/pr/9', author: { login: 'someone' } };
+
+  it('resolves an explicit PR number', async () => {
+    execImpl
+      .mockResolvedValueOnce({ stdout: 'o/r\n', stderr: '' }) // resolveRepoName
+      .mockResolvedValueOnce({ stdout: JSON.stringify(ghView), stderr: '' }); // gh pr view <n>
+    const result = await resolvePR({ path: '/tmp/proj', number: 9 });
+    expect(result).toEqual({ repo: 'o/r', number: 9, title: 'Ship it', branch: 'feat/x', url: 'https://example/pr/9', author: 'someone' });
+  });
+
+  it('resolves the current branch\'s open PR when no number is given', async () => {
+    execImpl
+      .mockResolvedValueOnce({ stdout: 'o/r\n', stderr: '' })
+      .mockResolvedValueOnce({ stdout: JSON.stringify(ghView), stderr: '' });
+    const result = await resolvePR({ path: '/tmp/proj' });
+    expect(result.number).toBe(9);
+    expect(execImpl).toHaveBeenCalledWith('gh', expect.arrayContaining(['pr', 'view']), expect.objectContaining({ timeout: expect.any(Number) }));
+  });
+
+  it('bounds gh/git subprocess lifetime so a hung CLI cannot hang the command (AGT-3408)', async () => {
+    execImpl
+      .mockResolvedValueOnce({ stdout: 'o/r\n', stderr: '' })
+      .mockResolvedValueOnce({ stdout: JSON.stringify(ghView), stderr: '' });
+    await resolvePR({ path: '/tmp/proj' });
+    for (const call of execImpl.mock.calls) {
+      const opts = call[2] as Record<string, unknown> | undefined;
+      expect(opts?.timeout).toBeTypeOf('number');
+      expect(opts?.timeout).toBeGreaterThan(0);
+    }
+  });
+
+  it('reports the branch name and a create hint when there is no open PR', async () => {
+    execImpl
+      .mockResolvedValueOnce({ stdout: 'o/r\n', stderr: '' })
+      .mockRejectedValueOnce(new Error('no pull requests found')) // gh pr view fails
+      .mockResolvedValueOnce({ stdout: 'feat/no-pr\n', stderr: '' }); // git rev-parse
+    await expect(resolvePR({ path: '/tmp/proj' })).rejects.toThrow(/No open PR for branch "feat\/no-pr"/);
+  });
+});
+
+describe('toPRInfo (INT-3282)', () => {
+  it('carries repo/number/title/branch/url/author through, stamping createdAt', () => {
+    const info = toPRInfo({ repo: 'o/r', number: 9, title: 'Ship it', branch: 'feat/x', url: 'https://example/pr/9', author: 'someone' });
+    expect(info).toMatchObject({ repo: 'o/r', number: 9, title: 'Ship it', branch: 'feat/x', url: 'https://example/pr/9', author: 'someone' });
+    expect(typeof info.createdAt).toBe('string');
+  });
+});

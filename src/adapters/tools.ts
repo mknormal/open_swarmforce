@@ -1,0 +1,1334 @@
+// ============================================
+// OpenSwarm - Agentic Tool Definitions & Executor
+// Created: 2026-04-11
+// Purpose: GPT/Local 어댑터가 Claude CLI와 동등한 도구 사용 능력을 갖도록
+//          공통 도구 정의 + 실행기 제공
+// ============================================
+
+import fs from 'node:fs/promises';
+import { existsSync, realpathSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { StringDecoder } from 'node:string_decoder';
+import { promisify } from 'node:util';
+import { homedir } from 'node:os';
+import path from 'node:path';
+import { webFetch, webSearch } from './webTools.js';
+import { isMcpTool, callMcpTool } from '../mcp/mcpClient.js';
+import { applyV4APatch } from './applyPatch.js';
+import { atomicWriteFile } from '../support/atomicFile.js';
+import { preserveTrailingNewline, pythonSyntaxError, wholeFileRewriteVerdict } from './writeGuards.js';
+import { COORDINATION_TOOL_NAMES, executeCoordinationTool, type CoordinationToolContext } from '../coordination/coordinationTools.js';
+import {
+  humanSurfaceShellWriteReason,
+  isHumanSurfaceReadOnlyEnabled,
+  stripHumanSurfaceEnv,
+} from '../mcp/humanSurfacePolicy.js';
+import { SandboxOutcomeUnknownError, type SandboxExecutorSession } from '../sandboxExecutor/protocol.js';
+import { looksLikeSandboxDenial, workerWritableRoots, wrapForSandbox } from '../support/osSandbox.js';
+import { listNotes, readNote, writeNote } from '../support/scratchpad.js';
+import { stageMemory, type RememberKind } from '../agents/stagedMemory.js';
+import { linkedMainCheckoutOf } from '../security/gitWorktreeIdentity.js';
+import { crossWorktreeAuditNote } from './crossWorktreeAudit.js';
+import { publicationCommandIn, publicationFenceMessage } from './publicationFence.js';
+import { resourceAwareTestCommand, testResourceShellPrefix, withTestResourceBudget } from '../support/testResourceBudget.js';
+import { isCommandBlocked } from './shellCommandGuard.js';
+
+const execFileAsync = promisify(execFile);
+
+let sandboxUnavailableWarned = false;
+function warnSandboxUnavailableOnce(): void {
+  if (sandboxUnavailableWarned) return;
+  sandboxUnavailableWarned = true;
+  console.warn('[Tools] workerSandbox is on but this host has no sandbox-exec/bwrap — bash runs unfenced');
+}
+
+/**
+ * The daemon's launchd PATH is minimal (/usr/bin:/bin:/opt/homebrew/bin, no
+ * ~/.cargo/bin or ~/.local/bin), and the `bash` tool runs non-login (`bash -c`),
+ * so it never sources the user's shell profile. Result: `cargo`/`uv`/`pyenv`
+ * shims are "command not found", the worker cannot build/test its Rust/Python
+ * changes, and the validation gate + reviewer reject it → Max-iteration STUCK
+ * (observed live on every WAVE Rust task: "cargo: command not found"). Prepend
+ * the common user tool bins a login shell would have added. (INT-2485)
+ */
+export function buildBashToolEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const home = homedir();
+  const extra = [
+    path.join(home, '.cargo', 'bin'),
+    path.join(home, '.local', 'bin'),
+    path.join(home, 'go', 'bin'),
+    path.join(home, '.bun', 'bin'),
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+  ];
+  const current = (base.PATH ?? '').split(':').filter(Boolean);
+  const merged = [...extra.filter((p) => !current.includes(p)), ...current];
+  return withTestResourceBudget(stripHumanSurfaceEnv({ ...base, PATH: merged.join(':') }));
+}
+
+// ============ 도구 정의 (OpenAI function calling 포맷) ============
+
+export interface ToolDefinition {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
+}
+
+export const TOOL_DEFINITIONS: ToolDefinition[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'read_file',
+      description: 'Read a file and return its content. Use offset/limit for large files. Local-only assets may be read under /warehouse when provisioned.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Absolute file path to read' },
+          offset: { type: 'number', description: 'Start line (0-based). Default: 0' },
+          limit: { type: 'number', description: 'Max lines to read. Default: 500' },
+        },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'remember',
+      description: 'Stage one durable lesson for this repository. It is NOT shared yet: it stays in this run\'s scratchpad and is promoted only if the whole run succeeds. Record a specific reusable pattern or constraint, never secrets or a guess.',
+      parameters: { type: 'object', properties: { kind: { type: 'string', enum: ['pattern', 'constraint'] }, title: { type: 'string' }, content: { type: 'string' } }, required: ['kind', 'title', 'content'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'write_file',
+      description: 'Write content to a file (creates or overwrites).',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Absolute file path' },
+          content: { type: 'string', description: 'File content to write' },
+        },
+        required: ['path', 'content'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'edit_file',
+      description: 'Replace a specific string in a file. old_string must be unique in the file.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Absolute file path' },
+          old_string: { type: 'string', description: 'Exact string to find and replace' },
+          new_string: { type: 'string', description: 'Replacement string' },
+        },
+        required: ['path', 'old_string', 'new_string'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_files',
+      description: 'Search file contents using ripgrep (regex). Returns matching lines with file paths and line numbers.',
+      parameters: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string', description: 'Regex pattern to search for' },
+          path: { type: 'string', description: 'Directory or file to search in' },
+          glob: { type: 'string', description: 'File glob filter (e.g., "*.ts")' },
+        },
+        required: ['pattern', 'path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'bash',
+      description: 'Execute a shell command and return stdout/stderr. Timeout: 30s. Destructive commands (rm -rf, git reset --hard) are blocked. In humanSurfaceReadOnly mode this is exposed only through an attested companion sandbox.',
+      parameters: {
+        type: 'object',
+        properties: {
+          command: { type: 'string', description: 'Shell command to execute' },
+        },
+        required: ['command'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_memory',
+      description:
+        "Search this repository's accumulated knowledge from past tasks — successful approaches (patterns) and reviewer pitfalls (constraints) — by semantic query. Call this BEFORE implementing to reuse what worked here and avoid known mistakes. Scoped to the current repo automatically.",
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'What to recall, e.g. "how auth migrations were handled" or "logout button"' },
+          limit: { type: 'number', description: 'Max results (1-10). Default: 5' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'scratch_write',
+      description:
+        'Save a note for yourself, outside the repository. Use it for what you worked out and '
+        + 'what you ruled out — a later iteration of this same task is shown these notes and '
+        + 'otherwise starts with no memory of what you tried. Writing the same name again '
+        + 'replaces that note. Never put working files in the repository for this: anything '
+        + 'under the worktree is reviewed and can reach the pull request.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Short name for the note, e.g. "approach" or "ruled-out"' },
+          content: { type: 'string', description: 'The note, in Markdown' },
+        },
+        required: ['name', 'content'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'scratch_read',
+      description:
+        'Read back one of your notes by name, or list them all when called without a name. '
+        + 'The most recent notes are already in your prompt; use this to fetch an older one '
+        + 'that was left out of it.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Note name. Omit to list every note.' },
+        },
+      },
+    },
+  },
+];
+
+// apply_patch — gated to codex adapters only (codex models are RLHF-trained on the
+// V4A format; non-codex models emit valid-looking-but-wrong V4A, so they keep
+// edit_file). NOT part of TOOL_DEFINITIONS; the agentic loop adds it when
+// `applyPatch` is enabled. The V4A spec lives in the description so the model gets
+// it with the tool schema.
+export const APPLY_PATCH_TOOL: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'apply_patch',
+    description:
+      'Edit files with a V4A patch. The "input" argument MUST be exactly:\n' +
+      '*** Begin Patch\n' +
+      '*** Update File: <relative path>\n' +
+      '@@ <optional symbol/context to disambiguate>\n' +
+      ' <unchanged context line>\n' +
+      '-<line to remove>\n' +
+      '+<line to add>\n' +
+      ' <unchanged context line>\n' +
+      '*** End Patch\n' +
+      'Rules: relative paths only; include ~3 unchanged context lines around each change so the hunk anchors uniquely; ' +
+      'context/removed lines must match the file EXACTLY. Use "*** Add File: <path>" (body is all "+" lines) to create, ' +
+      '"*** Delete File: <path>" to remove, and "*** Move to: <path>" after an Update File header to rename. ' +
+      'Prefer this over editing by hand — it is the most reliable way to change code.',
+    parameters: {
+      type: 'object',
+      properties: {
+        input: { type: 'string', description: 'The full V4A patch (one "*** Begin Patch" … "*** End Patch" envelope).' },
+      },
+      required: ['input'],
+    },
+  },
+};
+
+// ============ 안전 가드 ============
+
+// Destructive-command matching lives in ./shellCommandGuard.ts (AGT-3436). It was
+// a regex sweep over raw text here, which both missed the shell's own rewriting
+// (`r"m" -rf /`, `\rm -rf /`, `r{m,} -rf /`) and refused harmless text that only
+// mentioned a destructive command (`echo "rm -rf stays blocked"`). That file
+// resolves a command the way bash does and matches destructive VERBS by word
+// position, so what it inspects is the command that will actually run.
+
+/**
+ * Tools a read-only run refuses to execute.
+ *
+ * Kept beside the loop's tool-list filter rather than inline, because the two
+ * drifted apart once already: `diagnostics` was withheld from the list but
+ * missing here, and the loop's own comment explains why that is not enough — a
+ * model calls tools it was never shown. `diagnostics` matters as much as `bash`
+ * does, since it runs a `tsc`/`ruff` binary found by walking up from the tree
+ * under review, with the full environment. (INT-3189, INT-2961)
+ */
+const READ_ONLY_DENIED_TOOLS = new Set([
+  'scratch_write',
+  'remember',
+  'write_file',
+  'edit_file',
+  'apply_patch',
+  'bash',
+  'web_fetch',
+  'web_search',
+  'diagnostics',
+]);
+
+const FILESYSTEM_DENIED_TOOLS = new Set([
+  ...TOOL_DEFINITIONS.map((tool) => tool.function.name),
+  'apply_patch',
+  'diagnostics',
+]);
+
+
+/** Did this spawn fail because the binary is not installed? */
+function isMissingExecutable(error: unknown): boolean {
+  return !!error && typeof error === 'object' && 'code' in error && (error as { code: unknown }).code === 'ENOENT';
+}
+
+/**
+ * `git grep` stand-in for ripgrep.
+ *
+ * Deliberately not a full reimplementation: it covers the case that matters —
+ * searching a repository — and says so plainly when it cannot, rather than
+ * returning an error the agent reads as "no matches". Line numbers and the
+ * 50-match cap match the ripgrep invocation so the output shape is the same.
+ */
+async function searchWithGitGrep(
+  pattern: string,
+  searchPath: string,
+  glob: string | undefined,
+  callId: string,
+  cwd: string,
+): Promise<ToolResult> {
+  const args = ['grep', '--no-color', '-n', '-I', '-E', '-e', pattern, '--'];
+  args.push(glob ? `${searchPath}/${glob}` : searchPath);
+  try {
+    const { stdout } = await execFileAsync('git', args, { cwd, timeout: 10000, maxBuffer: 1024 * 256 });
+    const lines = stdout.split('\n').filter(Boolean).slice(0, 50);
+    return { tool_call_id: callId, content: lines.length ? lines.join('\n') : '(no matches)', is_error: false };
+  } catch (error) {
+    // git grep also exits 1 for no matches.
+    if (error && typeof error === 'object' && 'code' in error && (error as { code: number }).code === 1) {
+      return { tool_call_id: callId, content: '(no matches)', is_error: false };
+    }
+    return {
+      tool_call_id: callId,
+      content:
+        'search_files is unavailable: ripgrep is not installed and git grep failed. ' +
+        'Install ripgrep, or run this inside a git repository. Do not treat this as "no matches".',
+      is_error: true,
+    };
+  }
+}
+
+// ============ 도구 실행기 ============
+
+export interface ToolCall {
+  id: string;
+  function: {
+    name: string;
+    arguments: string;  // JSON string
+  };
+}
+
+export interface ToolResult {
+  tool_call_id: string;
+  content: string;
+  is_error: boolean;
+  /** Stop the enclosing agent loop; retrying could duplicate a partial mutation. */
+  fatal?: 'execution_outcome_unknown';
+  /**
+   * What this call actually executed, as validation evidence — the command
+   * line (with `[exit N]` when it failed) or the checkers a diagnostics run
+   * used. Absent when nothing ran: refused, blocked, fenced, timed out, or a
+   * diagnostics call that had nothing to check. (AGT-4534)
+   */
+  executed?: string;
+}
+
+/** Evidence string for a bash command that ran to an exit code. */
+function executedCommand(command: string, exitCode: number): string {
+  return exitCode === 0 ? command : `${command} [exit ${exitCode}]`;
+}
+
+/**
+ * 루프 단위 read 캐시. 같은 작업 루프 안에서 동일 파일을 반복 read하면
+ * (모델이 edit 후 "고쳐졌나?" 확인하려 재read하는 패턴) 디스크를 다시 읽지 않고
+ * 캐시된 내용 + "변경 없음" 힌트를 반환해 토큰·턴 낭비를 줄인다.
+ * edit_file/write_file 성공 시 해당 경로를 무효화해 stale read를 막는다.
+ *
+ * LRU-bounded: a single 80-turn SWE run reading many offsets of large files
+ * could otherwise retain megabytes of numbered content for the whole loop.
+ * The Map preserves insertion order, so eviction drops the least-recently-used
+ * key once MAX_READ_CACHE_ENTRIES is exceeded.
+ */
+const MAX_READ_CACHE_ENTRIES = 64;
+
+export interface ReadCache {
+  store: Map<string, string>;
+}
+
+export function createReadCache(): ReadCache {
+  return { store: new Map() };
+}
+
+/** Cache read that bumps the key to most-recently-used. */
+function cacheGet(cache: ReadCache, key: string): string | undefined {
+  const value = cache.store.get(key);
+  if (value === undefined) return undefined;
+  // Re-insert to move to the end (MRU) so eviction targets truly-old entries.
+  cache.store.delete(key);
+  cache.store.set(key, value);
+  return value;
+}
+
+/** Cache write with LRU eviction once the entry cap is exceeded. */
+function cacheSet(cache: ReadCache, key: string, value: string): void {
+  cache.store.delete(key);
+  cache.store.set(key, value);
+  while (cache.store.size > MAX_READ_CACHE_ENTRIES) {
+    const oldest = cache.store.keys().next().value;
+    if (oldest === undefined) break;
+    cache.store.delete(oldest);
+  }
+}
+
+/** 캐시에서 한 파일의 모든 범위 엔트리를 제거 (edit/write 후 stale 방지) */
+function invalidateCache(cache: ReadCache | undefined, filePath: string): void {
+  if (!cache) return;
+  for (const key of cache.store.keys()) {
+    if (key.startsWith(`${filePath}#`)) cache.store.delete(key);
+  }
+}
+
+/** Ceiling on the text one `read_file` returns, trailer included. */
+const MAX_READ_FILE_BYTES = 256 * 1024;
+/** Room held back inside that ceiling for the trailer notice. */
+const READ_TRAILER_RESERVE_BYTES = 256;
+const READ_CHUNK_BYTES = 64 * 1024;
+/** How far past the window lines are still counted, so "(N more lines)" stays exact. */
+const READ_SCAN_MAX_BYTES = 1024 * 1024;
+
+/** The longest prefix of `text` within `maxBytes` UTF-8 bytes, cut on a code-point boundary. */
+function prefixWithinBytes(text: string, maxBytes: number): string {
+  if (Buffer.byteLength(text) <= maxBytes) return text;
+  let bytes = 0;
+  let end = 0;
+  for (const char of text) {
+    const width = Buffer.byteLength(char);
+    if (bytes + width > maxBytes) break;
+    bytes += width;
+    end += char.length;
+  }
+  return text.slice(0, end);
+}
+
+/** The numbered lines `read_file` returns, and what the trailer says about the rest. */
+interface ReadWindow {
+  lines: string[];
+  trailer: string;
+}
+
+/**
+ * Byte-bounded, line-windowed file read (AGT-3486).
+ *
+ * This was `fs.readFile` + `split('\n')` + `slice(offset, offset + limit)`: the
+ * WHOLE file became a string before the window picked its lines out. `limit`
+ * counts lines and a line has no upper bound, so a 200 MB log — or one 200 MB
+ * minified line in an otherwise small file — was materialized in full only for
+ * everything outside the window to be discarded, and the result handed the
+ * model whatever the window really was: one line, still 200 MB.
+ *
+ * The read is incremental now. Chunks are decoded, counted and kept only while
+ * they land inside the window; both the window and the returned text are capped
+ * — lines by `limit`, bytes by MAX_READ_FILE_BYTES. Lines past the window are
+ * still counted for a short distance so the familiar "(N more lines)" trailer
+ * stays exact for ordinary files, and a file too large for that scan is
+ * described in bytes rather than read to its end.
+ */
+async function readFileWindow(filePath: string, offset: number, limit: number): Promise<ReadWindow> {
+  const handle = await fs.open(filePath, 'r');
+  try {
+    const { size: fileBytes } = await handle.stat();
+    const buffer = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+    const decoder = new StringDecoder('utf8');
+    const budget = MAX_READ_FILE_BYTES - READ_TRAILER_RESERVE_BYTES;
+    const kept: string[] = [];
+    let line = 0;             // 0-based index of the line currently being read
+    let pending = '';         // its text, retained only from the window's first line on
+    let keptBytes = 0;
+    let position = 0;         // byte cursor for the next read
+    let atEof = false;
+    let clipped = false;      // the byte ceiling, not `limit`, ended the window
+    let after = '';           // whatever followed the window inside its chunk
+
+    while (!atEof && !clipped && kept.length < limit) {
+      // eslint-disable-next-line no-await-in-loop
+      const { bytesRead } = await handle.read(buffer, 0, READ_CHUNK_BYTES, position);
+      if (bytesRead === 0) {
+        atEof = true;
+        // A partial sequence at EOF is invalid UTF-8 either way; flushing keeps
+        // it in the line rather than silently dropping it.
+        const flush = decoder.end();
+        if (flush && !clipped && line >= offset) pending += flush;
+        break;
+      }
+      position += bytesRead;
+      const text = decoder.write(buffer.subarray(0, bytesRead));
+      let start = 0;
+      chunk: while (start <= text.length) {
+        const newline = text.indexOf('\n', start);
+        const endsLine = newline >= 0;
+        const fragment = endsLine ? text.slice(start, newline) : text.slice(start);
+        if (line < offset) {
+          if (!endsLine) break chunk;             // still counting down to the window
+          line++;
+        } else {
+          const prefix = `${line + 1}\t`;
+          const room = budget - keptBytes - Buffer.byteLength(prefix) - Buffer.byteLength(pending) - (endsLine ? 1 : 0);
+          if (Buffer.byteLength(fragment) > room) {
+            kept.push(prefix + pending + prefixWithinBytes(fragment, Math.max(room, 0)));
+            clipped = true;
+            break chunk;
+          }
+          pending += fragment;
+          if (endsLine) {
+            keptBytes += Buffer.byteLength(prefix) + Buffer.byteLength(pending) + 1;
+            kept.push(prefix + pending);
+            pending = '';
+            line++;
+            if (kept.length >= limit) {
+              after = text.slice(newline + 1);
+              break chunk;
+            }
+          }
+        }
+        if (!endsLine) break chunk;               // the line continues in the next chunk
+        start = newline + 1;
+      }
+    }
+    // A file whose last line has no newline: that line is still a line.
+    if (atEof && !clipped && pending) kept.push(`${line + 1}\t${pending}`);
+
+    let remaining: number | null = 0;
+    if (!atEof && !clipped) {
+      // The window is full: count what follows so the trailer can be exact, but
+      // only for as long as that stays cheap on a huge file.
+      let openLine = false;
+      const account = (tail: string): void => {
+        remaining = (remaining ?? 0) + (tail.match(/\n/g)?.length ?? 0);
+        if (tail) openLine = !tail.endsWith('\n');
+      };
+      account(after);
+      let scanned = 0;
+      let reachedEof = false;
+      while (scanned < READ_SCAN_MAX_BYTES) {
+        // eslint-disable-next-line no-await-in-loop
+        const { bytesRead } = await handle.read(buffer, 0, READ_CHUNK_BYTES, position);
+        if (bytesRead === 0) { reachedEof = true; break; }
+        position += bytesRead;
+        scanned += bytesRead;
+        account(decoder.write(buffer.subarray(0, bytesRead)));
+      }
+      if (!reachedEof) remaining = null;
+      else if (openLine) remaining += 1;
+    }
+
+    const trailer = clipped
+      ? `\n... (cut off at the ${Math.round(MAX_READ_FILE_BYTES / 1024)} KiB read cap; the file is ${fileBytes} bytes — read a narrower range with offset/limit, or use search_files)`
+      : remaining === null
+        ? `\n... (not counted to the end: ${fileBytes - position} bytes still unread — continue with offset=${line})`
+        : remaining > 0
+          ? `\n... (${remaining} more lines)`
+          : '';
+    return { lines: kept, trailer };
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Tool execution options — verification-harness protection.
+ * Found in SWE hybrid runs: the implementer model misattributed test failures
+ * to the verification script (run_tests.sh) and edited the script itself five
+ * times, destroying verification integrity. Protected files reject edit/write.
+ * The bash timeout is also configurable — the 30s default dies silently on
+ * docker-based test runs (minutes), which made models conclude "the
+ * environment is broken".
+ */
+export interface ToolExecOptions {
+  /** Filenames (matched by path suffix) for which edit_file/write_file are refused */
+  protectedFiles?: string[];
+  /**
+   * OS-level fence for the bash tool (AGT-4387): 'on' runs the command under
+   * sandbox-exec / bwrap with writes limited to the worktree and build caches
+   * (see support/osSandbox.ts); 'off' or unset runs it as the daemon user,
+   * which is what every worker did before a native (non-container) daemon
+   * made that the user's whole home directory.
+   */
+  sandbox?: 'on' | 'off';
+  /** Refuse publication commands (`git push`/`commit`, `gh pr`, `openswarm …`). (AGT-4418) */
+  forbidPublication?: boolean;
+  /** bash tool timeout (default DEFAULT_BASH_TIMEOUT_MS) */
+  bashTimeoutMs?: number;
+  /** Refuse mutation and shell tools even if a model emits hidden tool names. */
+  readOnly?: boolean;
+  /** Refuse every built-in filesystem/shell tool even if its hidden name is emitted. */
+  filesystemTools?: boolean;
+  /**
+   * Exact run-scoped execution allow-list. Tool schemas are only a model hint:
+   * providers may still emit a name they were not shown, while the daemon's
+   * process-wide MCP router can remember it from an earlier run.
+   */
+  allowedToolNames?: ReadonlySet<string>;
+  /** Run-scoped identity for worker coordination tool dispatch. */
+  coordinationContext?: CoordinationToolContext;
+  /** Attested strict-mode companion session. Never accepted by delegated CLIs. */
+  sandboxExecutorSession?: SandboxExecutorSession;
+  /**
+   * Epoch ms at which the enclosing agentic loop gives up, when it has one.
+   * `coordination_wait` clamps itself below this: a fixed ceiling alone would
+   * let a wait outlive the loop it claims to respect, and the loop would then
+   * report a timeout instead of the answer that was about to arrive.
+   * (AGT-4065, caught by the PR review.)
+   */
+  loopDeadlineAt?: number;
+  /**
+   * Which run's scratchpad `scratch_write`/`scratch_read` address. Absent means
+   * the stage has no scratchpad and both tools refuse rather than inventing one:
+   * a note written to a run id nobody reads back is worse than no note, because
+   * the agent believes it recorded something.
+   */
+  scratchpadRunId?: string;
+  /** Provenance attached to a staged remember entry. */
+  memoryContext?: { taskId: string; iteration: number };
+}
+
+const DEFAULT_BASH_TIMEOUT_MS = 30000;
+
+function canonicalizePath(candidate: string): string {
+  if (existsSync(candidate)) return realpathSync(candidate);
+  const suffix: string[] = [];
+  let ancestor = candidate;
+  while (!existsSync(ancestor)) {
+    const parent = path.dirname(ancestor);
+    if (parent === ancestor) break;
+    suffix.unshift(path.basename(ancestor));
+    ancestor = parent;
+  }
+  return path.join(realpathSync(ancestor), ...suffix);
+}
+
+export function isProtectedPath(resolved: string, protectedFiles?: string[]): boolean {
+  if (!protectedFiles?.length) return false;
+  return protectedFiles.some((p) => {
+    const absolute = path.resolve(p);
+    const canonical = canonicalizePath(absolute);
+    return resolved === canonical || resolved.endsWith(`/${p}`);
+  });
+}
+
+export interface ValidatePathOptions {
+  /**
+   * Also accept a path whose canonical form lands inside the main checkout this
+   * worktree belongs to. READ-ONLY tools only.
+   *
+   * A repo may symlink local-only material (data the agent needs but git cannot
+   * carry) from its main checkout into every worktree — cgf-portal's
+   * `link-local-assets.sh` post-checkout hook does exactly this for
+   * `docs/CGF_data` and the `.env` family. `canonicalizePath` resolves the
+   * symlink to its target in the main checkout, which is outside the worktree,
+   * so the read was refused and the agent reported the data as missing
+   * (AGT-4061: worker-86be asked the operator twice for files that were in
+   * fact linked into its worktree and readable).
+   *
+   * Reads only, never writes: writing into the main checkout would break
+   * worktree isolation — the exact failure `link-local-assets.sh` documents for
+   * `.venv`, where a guard test kept passing because the import resolved
+   * through the main tree instead of the worktree under test.
+   *
+   * Callers must additionally withhold this for `readOnly` runs. An ordinary
+   * worker can already reach the main checkout through the unvalidated `bash`
+   * tool, so there this is a usability fix, not a widening. A read-only
+   * reviewer has `bash` denied (READ_ONLY_DENIED_TOOLS), which makes this
+   * sandbox its real outbound boundary — INT-3189 — and it stays untouched.
+   */
+  allowMainCheckoutRead?: boolean;
+  /** Accept the configured warehouse root for read/search tools only. */
+  allowWarehouseRead?: boolean;
+}
+
+/** 프로젝트 경로 내로 접근을 제한하는 경로 검증 */
+export function validatePath(filePath: string, cwd: string, options: ValidatePathOptions = {}): string {
+  const requestedRoot = path.resolve(cwd);
+  const projectRoot = existsSync(requestedRoot) ? realpathSync(requestedRoot) : requestedRoot;
+  const resolved = path.resolve(projectRoot, filePath);
+  const canonical = canonicalizePath(resolved);
+  const inside = (root: string): boolean => {
+    const requested = path.resolve(root);
+    const canonicalRoot = existsSync(requested) ? realpathSync(requested) : requested;
+    const rel = path.relative(canonicalRoot, canonical);
+    return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel));
+  };
+  const mainCheckout = options.allowMainCheckoutRead ? linkedMainCheckoutOf(projectRoot) : null;
+  const warehouseRoot = options.allowWarehouseRead
+    ? (process.env.OPENSWARM_WAREHOUSE_ROOT?.trim() || '/warehouse')
+    : null;
+  // cwd 하위이거나, /tmp 하위만 허용. 문자열 prefix 비교는 상대 cwd를
+  // 전부 거부하고 `/repo-evil` 같은 sibling을 `/repo` 내부로 오인한다.
+  if (
+    !inside(projectRoot)
+    && !inside('/tmp')
+    && !(mainCheckout && inside(mainCheckout))
+    && !(warehouseRoot && inside(warehouseRoot))
+  ) {
+    // 모델이 자가수정하도록 안내 — 그냥 거부만 하면 같은 실수를 반복한다.
+    throw new Error(
+      `Path "${filePath}" is outside the project root (${projectRoot}). ` +
+      `Use a path relative to the project root instead, e.g. "." for the whole project or "src/...". ` +
+      `Do not use "/" or absolute paths outside ${projectRoot}.`,
+    );
+  }
+  return canonical;
+}
+
+// Normalize a single line for fuzzy edit matching: strip trailing whitespace and
+// fold common typographic variants (smart quotes, en/em dashes) plus NFKC. Lets a
+// near-miss old_string (a model re-typed a quote or trailing space) still locate
+// its line, instead of failing edit_file outright. (INT-2011)
+function normalizeEditLine(line: string): string {
+  return line
+    .replace(/[ \t]+$/, '')
+    .replace(/[‘’]/g, "'")
+    .replace(/[“”]/g, '"')
+    .replace(/[–—]/g, '-')
+    .normalize('NFKC');
+}
+
+/**
+ * Fuzzy fallback for edit_file: when `oldString` is not an exact substring, match
+ * it line-by-line under {@link normalizeEditLine}. Returns the EXACT original span
+ * only when the match is unique — 0 or >1 matches return null so the caller refuses
+ * rather than editing the wrong place. The span is line-bounded, so the offsets are
+ * exact (no ratio approximation). (INT-2011)
+ */
+function findFuzzyEditSpan(original: string, oldString: string): { start: number; end: number } | null {
+  const fileLines = original.split('\n');
+  const oldLines = oldString.split('\n');
+  if (oldLines.length === 0 || oldLines.length > fileLines.length) return null;
+  const normFile = fileLines.map(normalizeEditLine);
+  const normOld = oldLines.map(normalizeEditLine);
+
+  let matchIndex = -1;
+  let count = 0;
+  for (let i = 0; i <= normFile.length - normOld.length; i++) {
+    let ok = true;
+    for (let j = 0; j < normOld.length; j++) {
+      if (normFile[i + j] !== normOld[j]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      count++;
+      matchIndex = i;
+      if (count > 1) return null; // ambiguous → refuse
+    }
+  }
+  if (count !== 1) return null; // not found → refuse
+
+  const start = fileLines.slice(0, matchIndex).join('\n').length + (matchIndex > 0 ? 1 : 0);
+  const matched = fileLines.slice(matchIndex, matchIndex + oldLines.length).join('\n');
+  return { start, end: start + matched.length };
+}
+
+/**
+ * 단일 도구 호출 실행
+ */
+export async function executeTool(
+  toolCall: ToolCall,
+  cwd: string,
+  cache?: ReadCache,
+  execOptions?: ToolExecOptions,
+): Promise<ToolResult> {
+  const { name, arguments: argsJson } = toolCall.function;
+  const callId = toolCall.id;
+
+  try {
+    if (execOptions?.allowedToolNames && !execOptions.allowedToolNames.has(name)) {
+      return {
+        tool_call_id: callId,
+        content: `TOOL_NOT_ALLOWED: ${name} was not granted for this run.`,
+        is_error: true,
+      };
+    }
+    const args = JSON.parse(argsJson);
+    if (execOptions?.filesystemTools === false && FILESYSTEM_DENIED_TOOLS.has(name)) {
+      return {
+        tool_call_id: callId,
+        content: `FILESYSTEM_DISABLED: ${name} is disabled for this coordination-only run.`,
+        is_error: true,
+      };
+    }
+    // `web_fetch`/`web_search` are withheld from the tool list in readOnly, but
+    // the denial lives here too: a model can emit a call for a tool it was never
+    // shown, and an outbound request is the exfiltration path the mode exists to
+    // close. Withholding is the hint; this is the enforcement. (INT-3189)
+    // MCP tools are denied by predicate, not by name: their names are whatever
+    // the servers declare, so no fixed list can cover them. Skipping discovery
+    // in the adapter is not enough on its own — a long-lived daemon that
+    // resolved these servers during an earlier ordinary run still has them in
+    // `serverByTool`, and a later read-only run whose model emits `server__tool`
+    // would connect to one. (INT-3189)
+    const readOnlyDenied = execOptions?.readOnly
+      && (READ_ONLY_DENIED_TOOLS.has(name) || isMcpTool(name));
+    if (readOnlyDenied) {
+      return {
+        tool_call_id: callId,
+        content: `READ_ONLY: ${name} is disabled for this run. Use read_file/search_files/search_memory only.`,
+        is_error: true,
+      };
+    }
+
+    const MAX_READ_FILE_LIMIT = 2000;
+    const MAX_READ_FILE_OFFSET = 1_000_000;
+
+    function normalizeReadFileOffset(offset: unknown): number {
+      if (typeof offset !== 'number' || !Number.isFinite(offset) || offset < 0 || offset > MAX_READ_FILE_OFFSET) {
+        return 0;
+      }
+      return Math.trunc(offset);
+    }
+
+    function normalizeReadFileLimit(limit: unknown): number {
+      if (typeof limit !== 'number' || !Number.isFinite(limit) || limit < 1) {
+        return 500;
+      }
+      return Math.min(Math.trunc(limit), MAX_READ_FILE_LIMIT);
+    }
+
+    switch (name) {
+      case 'read_file': {
+        // Reads may follow a symlink into this worktree's main checkout, so an
+        // agent can reach local-only material the repo links in (AGT-4061).
+        // Withheld in readOnly: there `bash` is denied, so this sandbox is the
+        // run's real outbound boundary (INT-3189).
+        const filePath = validatePath(args.path, cwd, {
+          allowMainCheckoutRead: !execOptions?.readOnly,
+          allowWarehouseRead: true,
+        });
+        const offset = normalizeReadFileOffset(args.offset);
+        const limit = normalizeReadFileLimit(args.limit);
+        const cacheKey = `${filePath}#${offset}:${limit}`;
+
+        // 같은 루프에서 이미 같은 범위를 읽었으면 디스크 재접근 없이 캐시 반환.
+        // 모델에게 "변경 없음"을 알려 추가 확인 read를 유도하지 않는다.
+        const cached = cache ? cacheGet(cache, cacheKey) : undefined;
+        if (cached !== undefined) {
+          // Re-read of the same range: return a STUB, not the full content. Re-
+          // injecting the content every time is what bloats a read-heavy worker's
+          // context (measured: 37 identical reads → 575k tokens). The content is
+          // already earlier in the conversation; point the model back to it instead
+          // of duplicating it. (Use a different offset to see other parts.)
+          return {
+            tool_call_id: callId,
+            content: `(already read ${args.path} [lines ${offset + 1}-${offset + limit}] earlier this turn-loop — UNCHANGED. Content omitted to save context; use what you already read above. To see other parts, read with a different offset. Otherwise stop reading and act.)`,
+            is_error: false,
+          };
+        }
+
+        const { lines: slice, trailer } = await readFileWindow(filePath, offset, limit);
+        const numbered = slice.join('\n');
+        const result = numbered + trailer;
+        if (cache) cacheSet(cache, cacheKey, result);
+        return { tool_call_id: callId, content: result, is_error: false };
+      }
+
+      case 'write_file': {
+        const filePath = validatePath(args.path, cwd);
+        if (isProtectedPath(filePath, execOptions?.protectedFiles)) {
+          return {
+            tool_call_id: callId,
+            content: `PROTECTED: ${args.path} is part of the verification harness and must not be modified. ` +
+              `If tests fail, the cause is in the SOURCE code (or your fix) — debug from the test output instead.`,
+            is_error: true,
+          };
+        }
+        // An existing file: refuse a rewrite that drops a large share of it,
+        // keep its trailing newline, and do not write Python that cannot parse
+        // (AGT-4406). A new file is written as given.
+        let content: string = args.content;
+        const original = await fs.readFile(filePath, 'utf-8').catch(() => null);
+        if (original !== null) {
+          const refusal = wholeFileRewriteVerdict(original, content);
+          if (refusal) return { tool_call_id: callId, content: refusal, is_error: true };
+          content = preserveTrailingNewline(original, content);
+        }
+        const syntaxError = await pythonSyntaxError(filePath, content);
+        if (syntaxError) {
+          return { tool_call_id: callId, content: `REFUSED: ${path.basename(filePath)} would not parse — ${syntaxError}. Nothing was written.`, is_error: true };
+        }
+        // 디렉토리 자동 생성
+        await fs.mkdir(path.dirname(filePath), { recursive: true });
+        await atomicWriteFile(filePath, content);
+        invalidateCache(cache, filePath);
+        return { tool_call_id: callId, content: `Written: ${filePath}`, is_error: false };
+      }
+
+      case 'edit_file': {
+        const filePath = validatePath(args.path, cwd);
+        if (isProtectedPath(filePath, execOptions?.protectedFiles)) {
+          return {
+            tool_call_id: callId,
+            content: `PROTECTED: ${args.path} is part of the verification harness and must not be modified. ` +
+              `If tests fail, the cause is in the SOURCE code (or your fix) — debug from the test output instead.`,
+            is_error: true,
+          };
+        }
+        const original = await fs.readFile(filePath, 'utf-8');
+        const occurrences = original.split(args.old_string).length - 1;
+        if (occurrences > 1) {
+          return { tool_call_id: callId, content: `old_string found ${occurrences} times — must be unique. Provide more context.`, is_error: true };
+        }
+        // Resolve the exact span to replace. Exact match first; on a miss, fall back
+        // to line-normalized fuzzy matching (trailing whitespace / smart quotes /
+        // dashes) — but only when it's unique, so we never edit the wrong place. (INT-2011)
+        let editStart: number;
+        let editEnd: number;
+        let fuzzy = false;
+        if (occurrences === 1) {
+          editStart = original.indexOf(args.old_string);
+          editEnd = editStart + args.old_string.length;
+        } else {
+          const span = findFuzzyEditSpan(original, args.old_string);
+          if (!span) {
+            return { tool_call_id: callId, content: `old_string not found in ${filePath}`, is_error: true };
+          }
+          editStart = span.start;
+          editEnd = span.end;
+          fuzzy = true;
+        }
+        const updated = preserveTrailingNewline(original, original.slice(0, editStart) + args.new_string + original.slice(editEnd));
+        await atomicWriteFile(filePath, updated);
+        invalidateCache(cache, filePath);
+        // Applied, but say so: an edit can legitimately be one of several that
+        // only parse together, so this warns instead of refusing (AGT-4406).
+        const parseWarning = await pythonSyntaxError(filePath, updated);
+        // Return the changed region so the model can verify without a re-read.
+        // editStart is the exact offset in the ORIGINAL (exact or fuzzy), so the
+        // line math is correct either way.
+        const newLines = updated.split('\n');
+        const editLine = original.slice(0, editStart).split('\n').length - 1;
+        const from = Math.max(0, editLine - 3);
+        const to = Math.min(newLines.length, editLine + args.new_string.split('\n').length + 3);
+        const snippet = newLines.slice(from, to).map((l, i) => `${from + i + 1}\t${l}`).join('\n');
+        return {
+          tool_call_id: callId,
+          content: `Edited: ${filePath}${fuzzy ? ' (matched with whitespace/quote normalization)' : ''}`
+            + `${parseWarning ? `\n⚠ The file no longer parses: ${parseWarning}. Fix it before finishing.` : ''}`
+            + `\nResulting region:\n${snippet}`,
+          is_error: false,
+        };
+      }
+
+      case 'apply_patch': {
+        // V4A patch (codex-native edit format). Validate each touched path + protect
+        // the verification harness, then apply via the shared applier.
+        const patchText: string = args.input ?? args.patch ?? '';
+        if (!/\*\*\* Begin Patch/.test(patchText)) {
+          return { tool_call_id: callId, content: 'apply_patch: "input" must be a V4A patch starting with "*** Begin Patch".', is_error: true };
+        }
+        // Scan BOTH the source headers and `*** Move to:` targets — a rename can
+        // overwrite a protected harness path that no Update/Add/Delete header names. (INT-1928)
+        // `.trim()` on the line, because that is what parseV4A does before it
+        // matches a header. Scanning the raw line while the parser trims meant
+        // one leading space hid a header from this guard and still applied it —
+        // the guard is the only protection, applyV4APatch has none of its own.
+        const protectedHit = patchText
+          .split('\n')
+          .map((raw) => raw.trim())
+          .map((l) =>
+            l.match(/^\*\*\* (?:Update|Add|Delete) File: (.+)$/)?.[1]?.trim()
+            ?? l.match(/^\*\*\* Move to: (.+)$/)?.[1]?.trim(),
+          )
+          .filter((p): p is string => !!p)
+          .find((p) => isProtectedPath(validatePath(p, cwd), execOptions?.protectedFiles));
+        if (protectedHit) {
+          return {
+            tool_call_id: callId,
+            content: `PROTECTED: ${protectedHit} is part of the verification harness and must not be modified. ` +
+              `If tests fail, the cause is in the SOURCE code (or your fix) — debug from the test output instead.`,
+            is_error: true,
+          };
+        }
+        const { changed, errors } = await applyV4APatch(patchText, cwd, (p) => validatePath(p, cwd));
+        for (const rel of changed) invalidateCache(cache, validatePath(rel, cwd));
+        if (errors.length > 0) {
+          return {
+            tool_call_id: callId,
+            content: `apply_patch ${changed.length ? `partially applied (${changed.join(', ')}); ` : 'failed; '}errors:\n${errors.join('\n')}\n` +
+              `Fix: ensure context/removed lines match the file EXACTLY (read the file first), then resend the patch.`,
+            is_error: true,
+          };
+        }
+        return { tool_call_id: callId, content: `Patched: ${changed.join(', ')}`, is_error: false };
+      }
+
+      case 'search_files': {
+        const searchPath = validatePath(args.path, cwd, {
+          allowMainCheckoutRead: !execOptions?.readOnly,
+          allowWarehouseRead: true,
+        });
+        const rgArgs = ['--no-heading', '--line-number', '--max-count', '50'];
+        if (args.glob) {
+          rgArgs.push('--glob', args.glob);
+        }
+        rgArgs.push(args.pattern, searchPath);
+
+        try {
+          const { stdout } = await execFileAsync('rg', rgArgs, { timeout: 10000, maxBuffer: 1024 * 256 });
+          return { tool_call_id: callId, content: stdout || '(no matches)', is_error: false };
+        } catch (err) {
+          // rg exit code 1 = no matches
+          if (err && typeof err === 'object' && 'code' in err && (err as { code: number }).code === 1) {
+            return { tool_call_id: callId, content: '(no matches)', is_error: false };
+          }
+          // ripgrep is not everywhere. On a hosted CI runner it can be absent
+          // entirely, and then every search returns ENOENT: the agent learns
+          // that searching does not work, stops trying, and reviews the diff
+          // without ever looking at the surrounding code — while still emitting
+          // a confident verdict. Observed on a real GitHub Actions run: five
+          // consecutive `spawn rg ENOENT`, verdict `approve`. Falling back to
+          // git grep keeps the capability instead of silently losing it.
+          if (isMissingExecutable(err)) {
+            return searchWithGitGrep(args.pattern, searchPath, args.glob, callId, cwd);
+          }
+          throw err;
+        }
+      }
+
+      case 'bash': {
+        const command: string = args.command;
+        const boundedCommand = await resourceAwareTestCommand(command, cwd);
+        // Checked before every execution path below, including the attested
+        // sandbox one: a worker's job ends at the working tree (AGT-4418).
+        if (execOptions?.forbidPublication) {
+          const what = publicationCommandIn(command);
+          if (what) return { tool_call_id: callId, content: publicationFenceMessage(what), is_error: true };
+        }
+        // A command reaching into another task's worktree is made visible on
+        // both sides: the daemon log for the operator, the tool result for the
+        // model (AGT-4043). Never blocked — a linter pointed at a path is
+        // harmless; the note is what stops the pytest variant.
+        const auditNote = crossWorktreeAuditNote(command, cwd);
+        if (auditNote) console.warn(`[Audit] bash in ${cwd} referenced another worktree: ${command.slice(0, 200)}`);
+        const audited = (result: ToolResult): ToolResult =>
+          auditNote ? { ...result, content: `${auditNote}\n${result.content}` } : result;
+        if (isHumanSurfaceReadOnlyEnabled()) {
+          if (!execOptions?.sandboxExecutorSession) {
+            return {
+              tool_call_id: callId,
+              content: 'HUMAN_SURFACE_READ_ONLY: attested sandbox executor is unavailable',
+              is_error: true,
+            };
+          }
+          if (isCommandBlocked(command)) {
+            return { tool_call_id: callId, content: `BLOCKED: destructive command not allowed: ${command}`, is_error: true };
+          }
+          const limit = execOptions.bashTimeoutMs ?? DEFAULT_BASH_TIMEOUT_MS;
+          try {
+            const result = await execOptions.sandboxExecutorSession.execute(`${testResourceShellPrefix()} ${boundedCommand}`, limit);
+            const output = result.output.length > 8000
+              ? `...[sandbox output tail]\n${result.output.slice(-8000)}`
+              : result.output;
+            if (result.outputLimitExceeded) {
+              return {
+                tool_call_id: callId,
+                content: `OUTCOME_UNKNOWN_DO_NOT_RETRY: command hit the output ceiling after it may have modified the workspace\n${output}`,
+                is_error: true,
+                fatal: 'execution_outcome_unknown',
+              };
+            }
+            if (result.timedOut) {
+              return {
+                tool_call_id: callId,
+                content: `OUTCOME_UNKNOWN_DO_NOT_RETRY: timeout after ${limit}ms; the process tree was terminated but workspace writes may be partial.\n${output}`,
+                is_error: true,
+                fatal: 'execution_outcome_unknown',
+              };
+            }
+            if (result.exitCode !== 0) {
+              return {
+                tool_call_id: callId,
+                content: `${output || '(no output)'}\n[exit code ${result.exitCode ?? '?'}${result.signal ? `, signal ${result.signal}` : ''}]`,
+                is_error: true,
+                ...(typeof result.exitCode === 'number' ? { executed: executedCommand(command, result.exitCode) } : {}),
+              };
+            }
+            return { tool_call_id: callId, content: output || '(no output, exit 0)', is_error: false, executed: command };
+          } catch (error) {
+            if (error instanceof SandboxOutcomeUnknownError) {
+              return {
+                tool_call_id: callId,
+                content: error.message,
+                is_error: true,
+                fatal: 'execution_outcome_unknown',
+              };
+            }
+            return {
+              tool_call_id: callId,
+              content: `SANDBOX_EXECUTOR_FAILED: ${error instanceof Error ? error.message : String(error)}`,
+              is_error: true,
+            };
+          }
+        }
+        const humanSurfaceDenial = humanSurfaceShellWriteReason(command);
+        if (humanSurfaceDenial) {
+          return { tool_call_id: callId, content: `HUMAN_SURFACE_READ_ONLY: ${humanSurfaceDenial}`, is_error: true };
+        }
+        if (isCommandBlocked(command)) {
+          return { tool_call_id: callId, content: `BLOCKED: destructive command not allowed: ${command}`, is_error: true };
+        }
+        const fenced = execOptions?.sandbox === 'on'
+          ? wrapForSandbox(['bash', '-c', boundedCommand], {
+            writableRoots: workerWritableRoots(cwd, execOptions.scratchpadRunId),
+            allowNetwork: true,
+          })
+          : null;
+        if (execOptions?.sandbox === 'on' && !fenced) warnSandboxUnavailableOnce();
+        try {
+          const { stdout, stderr } = await execFileAsync(fenced?.file ?? 'bash', fenced?.args ?? ['-c', boundedCommand], {
+            cwd,
+            timeout: execOptions?.bashTimeoutMs ?? DEFAULT_BASH_TIMEOUT_MS,
+            maxBuffer: 1024 * 512,
+            env: buildBashToolEnv(),
+          });
+          const output = stdout + (stderr ? `\n[stderr] ${stderr}` : '');
+          // 출력이 너무 길면 잘라냄
+          return audited({
+            tool_call_id: callId,
+            content: output.length > 8000 ? output.slice(0, 8000) + '\n... (truncated)' : output || '(no output, exit 0)',
+            is_error: false,
+            executed: command,
+          });
+        } catch (err) {
+          // exit code != 0 → execFile이 throw. 하지만 grep/find 등은 "매치 없음"으로
+          // exit 1을 내며 이건 정상이다. 실제 stdout/stderr + exit code를 모델에게 줘서
+          // "no match"인지 진짜 에러인지 스스로 판단하게 한다(이게 없으면 같은 명령 반복).
+          const e = err as { code?: number; stdout?: string; stderr?: string; message?: string; killed?: boolean; signal?: string };
+          const out = (e.stdout ?? '') + (e.stderr ? `\n[stderr] ${e.stderr}` : '');
+          const code = typeof e.code === 'number' ? e.code : '?';
+          // Make timeout kills explicit — a silent no-output failure leads the
+          // model to conclude "the verification environment is broken" and start
+          // dismantling the harness (observed in SWE runs).
+          if (e.killed && e.signal) {
+            const limit = execOptions?.bashTimeoutMs ?? DEFAULT_BASH_TIMEOUT_MS;
+            return {
+              tool_call_id: callId,
+              content: `TIMEOUT: command exceeded ${Math.round(limit / 1000)}s and was killed (${e.signal}). ` +
+                `The command may simply be slow — this is NOT evidence that the environment or script is broken. ` +
+                `Partial output:\n${out.slice(0, 2000) || '(none)'}`,
+              is_error: true,
+            };
+          }
+          // Name the fence when it is what refused the write, so the model fixes
+          // its target instead of concluding the filesystem is broken.
+          const fenceHint = fenced && looksLikeSandboxDenial(out)
+            ? '\n[sandbox] Writes are limited to this worktree, the temp dir and build caches; this command tried to write elsewhere.'
+            : '';
+          const body = out.trim()
+            ? `exit ${code}:\n${out.slice(0, 4000)}${fenceHint}`
+            : `exit ${code} (no output) — likely no matches or a non-fatal nonzero exit, not necessarily an error.`;
+          // exit 1 + 출력 없음은 보통 무해(grep no-match) → is_error를 false로 둬 모델이 안 헤매게.
+          const benign = e.code === 1 && !out.trim();
+          // A numeric exit code means the command ran; a string code (ENOENT…)
+          // means it never started.
+          return audited({
+            tool_call_id: callId,
+            content: body,
+            is_error: !benign,
+            ...(typeof e.code === 'number' ? { executed: executedCommand(command, e.code) } : {}),
+          });
+        }
+      }
+
+      case 'search_memory': {
+        const query = String(args.query ?? '').trim();
+        if (!query) {
+          return { tool_call_id: callId, content: 'search_memory requires a non-empty "query".', is_error: true };
+        }
+        try {
+          // Loaded lazily: the memory core pulls in LanceDB + the embedding model,
+          // which we don't want as a static dependency of every tools.ts consumer.
+          // Same helper backs the MCP memory server so results stay identical.
+          const { searchRepoMemoryText } = await import('../memory/repoKnowledge.js');
+          const text = await searchRepoMemoryText(cwd, query, Number(args.limit) || 5);
+          return { tool_call_id: callId, content: text, is_error: false };
+        } catch (err) {
+          return { tool_call_id: callId, content: `search_memory failed: ${err instanceof Error ? err.message : String(err)}`, is_error: false };
+        }
+      }
+
+      case 'scratch_write':
+      case 'scratch_read': {
+        const runId = execOptions?.scratchpadRunId;
+        if (!runId) {
+          return {
+            tool_call_id: callId,
+            content: `NO_SCRATCHPAD: ${name} is unavailable in this run.`,
+            is_error: true,
+          };
+        }
+        if (name === 'scratch_read') {
+          const noteName = typeof args.name === 'string' ? args.name.trim() : '';
+          if (!noteName) {
+            const notes = await listNotes(runId);
+            const listing = notes.length === 0
+              ? 'No notes yet.'
+              : notes.map((note) => `- ${note.name} (${note.bytes} bytes)`).join('\n');
+            return { tool_call_id: callId, content: listing, is_error: false };
+          }
+          const body = await readNote(runId, noteName);
+          return body === undefined
+            ? { tool_call_id: callId, content: `No note named "${noteName}".`, is_error: true }
+            : { tool_call_id: callId, content: body, is_error: false };
+        }
+        const noteName = String(args.name ?? '').trim();
+        const content = typeof args.content === 'string' ? args.content : '';
+        if (!noteName) {
+          return { tool_call_id: callId, content: 'scratch_write requires a non-empty "name".', is_error: true };
+        }
+        try {
+          const { bytes } = await writeNote(runId, noteName, content);
+          return { tool_call_id: callId, content: `Saved note "${noteName}" (${bytes} bytes).`, is_error: false };
+        } catch (err) {
+          // A budget refusal is the model's to act on — it can shorten the note
+          // or drop one — so it comes back as a tool error, not an exception.
+          const reason = err instanceof Error ? err.message : String(err);
+          return { tool_call_id: callId, content: `scratch_write refused: ${reason}`, is_error: true };
+        }
+      }
+
+      case 'remember': {
+        const runId = execOptions?.scratchpadRunId;
+        const context = execOptions?.memoryContext;
+        if (!runId || !context) return { tool_call_id: callId, content: 'NO_SCRATCHPAD: remember is unavailable in this run.', is_error: true };
+        const kind = args.kind as RememberKind;
+        const title = typeof args.title === 'string' ? args.title.trim() : '';
+        const content = typeof args.content === 'string' ? args.content.trim() : '';
+        if ((kind !== 'pattern' && kind !== 'constraint') || !title || !content) return { tool_call_id: callId, content: 'remember requires kind (pattern or constraint), title, and content.', is_error: true };
+        try {
+          await stageMemory(runId, { kind, title, content, taskId: context.taskId, iteration: context.iteration });
+          return { tool_call_id: callId, content: 'Staged this lesson in the scratchpad. It will be promoted only if this run succeeds.', is_error: false };
+        } catch (err) { return { tool_call_id: callId, content: `remember refused: ${err instanceof Error ? err.message : String(err)}`, is_error: true }; }
+      }
+
+      case 'diagnostics': {
+        if (isHumanSurfaceReadOnlyEnabled()) {
+          return {
+            tool_call_id: callId,
+            content: 'HUMAN_SURFACE_READ_ONLY: diagnostics subprocess execution is disabled while humanSurfaceReadOnly.enabled is true',
+            is_error: true,
+          };
+        }
+        // Lazy: only loops that opted in (AgenticLoopOptions.diagnosticsTool)
+        // expose the schema, so most consumers never load this module.
+        const { runDiagnosticsCheck } = await import('./diagnosticsTool.js');
+        const { text, ran } = await runDiagnosticsCheck(args.paths, cwd);
+        return {
+          tool_call_id: callId,
+          content: text,
+          is_error: false,
+          ...(ran.length > 0 ? { executed: `diagnostics: ${ran.join(', ')}` } : {}),
+        };
+      }
+
+      case 'web_fetch': {
+        const text = await webFetch(args.url);
+        return { tool_call_id: callId, content: text, is_error: text.startsWith('Invalid URL') || text.startsWith('Fetch ') };
+      }
+
+      case 'web_search': {
+        const text = await webSearch(args.query, args.max_results);
+        return { tool_call_id: callId, content: text, is_error: text.startsWith('Search failed') || text.startsWith('Invalid query') };
+      }
+
+      default:
+        if (COORDINATION_TOOL_NAMES.has(name)) {
+          if (!execOptions?.coordinationContext) {
+            return { tool_call_id: callId, content: 'Coordination tools are unavailable outside a scoped autonomous run.', is_error: true };
+          }
+          const result = await executeCoordinationTool(
+            name,
+            { ...(args ?? {}) as Record<string, unknown>, __loopDeadlineAt: execOptions.loopDeadlineAt },
+            execOptions.coordinationContext,
+          );
+          return { tool_call_id: callId, content: result.content, is_error: result.isError };
+        }
+        // MCP tools (named `server__tool`) route to their server via the MCP client.
+        if (isMcpTool(name)) {
+          const result = await callMcpTool(name, (args ?? {}) as Record<string, unknown>);
+          return {
+            tool_call_id: callId,
+            content: result.content,
+            is_error: result.isError,
+          };
+        }
+        return { tool_call_id: callId, content: `Unknown tool: ${name}`, is_error: true };
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { tool_call_id: callId, content: `Tool error: ${msg}`, is_error: true };
+  }
+}
+
+/**
+ * 여러 도구 호출을 병렬 실행
+ */
+export async function executeToolCalls(
+  toolCalls: ToolCall[],
+  cwd: string,
+  cache?: ReadCache,
+  execOptions?: ToolExecOptions,
+): Promise<ToolResult[]> {
+  const readOnlyTools = new Set(['read_file', 'search_files', 'search_memory', 'scratch_read', 'web_fetch', 'web_search']);
+  const results: ToolResult[] = [];
+  let index = 0;
+  while (index < toolCalls.length) {
+    const call = toolCalls[index];
+    if (!readOnlyTools.has(call.function.name)) {
+      const result = await executeTool(call, cwd, cache, execOptions);
+      results.push(result);
+      index++;
+      if (result.fatal) {
+        while (index < toolCalls.length) {
+          results.push({
+            tool_call_id: toolCalls[index++].id,
+            content: 'SKIPPED: a prior command has unknown outcome; no later tool was executed',
+            is_error: true,
+            fatal: 'execution_outcome_unknown',
+          });
+        }
+      }
+      continue;
+    }
+
+    // Parallelize only a contiguous read-only batch. A mutating call is a
+    // barrier, so reads cannot observe half-applied edits and two model-issued
+    // writes can never race their read/modify/write or rollback snapshots.
+    const batch: ToolCall[] = [];
+    while (index < toolCalls.length && readOnlyTools.has(toolCalls[index].function.name)) {
+      batch.push(toolCalls[index++]);
+    }
+    results.push(...await Promise.all(batch.map((item) => executeTool(item, cwd, cache, execOptions))));
+  }
+  return results;
+}

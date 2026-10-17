@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>SWARMFORGE · Orchestration</title>
+  <script src="/static/js/themeBoot.js"></script>
+  <script src="/static/js/webToken.js"></script>
+  <link rel="stylesheet" href="/static/css/tokens.css" />
+  <link rel="stylesheet" href="/static/css/shell.css" />
+  <link rel="stylesheet" href="/static/css/orchestration.css" />
+</head>
+<body class="page-orchestration">
+  <header class="topbar">
+    <a class="brand" href="/app"><svg class="brand-mark" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" focusable="false"><path d="M12 2.5 20.5 7.4v9.2L12 21.5 3.5 16.6V7.4Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M12 7.8 16.2 15.4H7.8Z" fill="currentColor"/></svg><span class="brand-wordmark">SWARMFORGE</span></a>
+    <span class="page-title">Orchestration</span>
+    <nav class="topbar-nav" aria-label="Pages">
+      <a href="/app">Cockpit</a>
+      <a href="/chat">Chat</a>
+      <a href="/orchestration" aria-current="page">Orchestration</a>
+      <a href="/threads">Threads</a>
+      <a href="/warehouse">Warehouse</a>
+      <a href="/usage">Usage</a>
+      <a href="/">Supervisor</a>
+    </nav>
+    <div class="topbar-spacer"></div>
+    <div class="topbar-actions">
+      <button type="button" id="theme-toggle" class="btn btn-ghost btn-icon theme-toggle" aria-label="Switch theme" aria-pressed="false">
+        <span class="when-dark" aria-hidden="true">☾</span><span class="when-light" aria-hidden="true">☀</span>
+      </button>
+    </div>
+  </header>
+
+  <div id="waiting" class="waiting" role="status" aria-live="polite"></div>
+
+  <div class="orch-toolbar">
+    <div id="controls" role="group" aria-label="Filter the board">
+      <input id="filter-search" class="input" type="search" autocomplete="off" placeholder="Search agents…" aria-label="Search agents" />
+      <select id="filter-task" class="select" aria-label="Filter by task" data-options="">
+        <option value="">All tasks</option>
+      </select>
+      <select id="filter-role" class="select" aria-label="Filter by role">
+        <option value="">All roles</option>
+        <option value="worker">worker</option>
+        <option value="reviewer">reviewer</option>
+        <option value="orchestrator">orchestrator</option>
+        <option value="review-agent">review agent</option>
+        <option value="daemon">daemon</option>
+        <option value="human">operator</option>
+      </select>
+      <label for="filter-idle">
+        <input id="filter-idle" type="checkbox" /> Show idle <span id="idle-count"></span>
+      </label>
+    </div>
+    <div id="stats" aria-label="Board statistics"></div>
+  </div>
+
+  <main class="orch-main">
+    <div id="graph-wrap">
+      <svg id="graph" role="img" aria-label="Agent interaction graph"></svg>
+      <div id="legend" aria-label="Legend"></div>
+    </div>
+    <aside class="orch-aside" aria-label="Selection details">
+      <h2>Agent detail</h2>
+      <div id="detail"><div class="empty">Select a node</div></div>
+      <h2>Event feed</h2>
+      <div id="feed"><div class="empty">Loading…</div></div>
+      <h2>Conversation</h2>
+      <div id="thread"><div class="empty">Select an event to read its conversation</div></div>
+    </aside>
+  </main>
+
+  <script type="module">
+    import { startOrchestrationView } from '/static/js/orchestrationView.mjs';
+    import { installThemeToggle } from '/static/js/theme.mjs';
+    installThemeToggle(document, document.getElementById('theme-toggle'));
+    startOrchestrationView(document);
+  </script>
+</body>
+</html>

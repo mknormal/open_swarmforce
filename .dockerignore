@@ -1,0 +1,45 @@
+# Dependencies (rebuilt inside the image)
+node_modules/
+
+# Host build artifacts — the image builds its own dist; a stale host dist
+# copied over it would mask build failures.
+dist/
+build/
+*.tgz
+
+# Secrets and local state. config.yaml routinely embeds tokens via env
+# interpolation defaults; the runtime mounts it instead.
+.env
+.env.*
+config.yaml
+config.yml
+config.json
+.openswarm/
+.coverage/
+
+# VCS / editor / OS
+.git/
+.gitignore
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Docker (self-referential)
+Dockerfile*
+docker-compose*
+.dockerignore
+
+# Tests, docs, CI — not part of the runtime image
+coverage/
+docs/
+benchmarks/
+desktop/
+web-e2e/
+.github/
+.claude/
+testing/
+trash/
+logs/
+*.log
+plan.md

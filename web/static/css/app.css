@@ -1,0 +1,222 @@
+/* OpenSwarm issue board components (INT-3388, AGT-4201). Consumes tokens.css +
+   shell.css. The shell (body grid, sidebar, views, status bar) lives in
+   cockpit.css — this file owns the Issues view's own widgets. */
+
+.repo-picker select {
+  width: 100%;
+  background: var(--bg-elevated);
+  color: var(--fg-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-sm);
+  font-family: var(--font-sans);
+}
+
+.daemon-status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--fg-muted);
+}
+
+/* Provider rate-limit gauge — hidden until the daemon observes usage headers. */
+.quota-gauge {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--fg-muted);
+  white-space: nowrap;
+}
+.quota-gauge[hidden] { display: none; }
+.daemon-status .dot {
+  width: 8px; height: 8px;
+  border-radius: var(--radius-full);
+  background: var(--fg-muted);
+}
+.daemon-status .dot[data-state="ok"] { background: var(--success); }
+.daemon-status .dot[data-state="down"] { background: var(--danger); }
+
+.panel {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+.panel-head h2 { margin: 0; font-size: var(--text-sm); font-weight: 600; }
+
+.muted { color: var(--fg-muted); font-size: var(--text-xs); }
+
+.issue-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-2);
+}
+
+.issue-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  user-select: none;
+}
+.issue-row:hover { background: var(--bg-hover); }
+.issue-row.selected { background: var(--accent-subtle); }
+.issue-row input[type="checkbox"] { accent-color: var(--accent); }
+.issue-row .identifier {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--accent);
+  min-width: 72px;
+}
+.issue-row .prio {
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  color: var(--fg-muted);
+  min-width: 22px;
+}
+.issue-row .prio[data-p="1"] { color: var(--danger); }
+.issue-row .prio[data-p="2"] { color: var(--warning); }
+.issue-row .title {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: var(--text-sm);
+}
+.issue-row .state {
+  font-size: var(--text-xs);
+  color: var(--fg-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  padding: 1px var(--space-2);
+  white-space: nowrap;
+}
+
+.deploy-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--border);
+}
+
+/* Two-step confirmation state (in-page consent — the Tauri WebView has no JS
+   dialogs): the armed button says what the second click will do. */
+.deploy-btn.arm { background: var(--warning); border-color: var(--warning); color: var(--fg-on-accent); }
+#selection-summary.error { color: var(--danger); }
+
+.work-cards {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.work-card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+}
+.work-card .head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.work-card .identifier {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--accent);
+}
+.work-card .title {
+  flex: 1;
+  font-size: var(--text-sm);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.work-card .stage-line {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  margin-top: var(--space-2);
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  color: var(--fg-muted);
+}
+.work-card .stage-line .glyph { width: 14px; text-align: center; }
+.work-card .stage-line[data-status="complete"] .glyph { color: var(--success); }
+.work-card .stage-line[data-status="fail"] .glyph { color: var(--danger); }
+.work-card .stage-line[data-status="start"] .glyph { color: var(--accent); }
+.work-card .error {
+  margin-top: var(--space-2);
+  color: var(--danger);
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  white-space: pre-wrap;
+}
+.work-card a { color: var(--accent); font-size: var(--text-xs); }
+
+/* Live agent output — a terminal pane fed by the hub's `log` events. */
+.console-toggle {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+  padding: 2px var(--space-2);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.console-toggle:hover { color: var(--fg-primary); border-color: var(--border-strong); }
+
+@media (max-width: 900px), (pointer: coarse) {
+  .console-toggle, .issue-row { min-height: 44px; }
+  .repo-picker select { min-height: 44px; font-size: 16px; }
+}
+
+.work-card .console {
+  margin-top: var(--space-2);
+  /* Deep ground against the card so the stream reads as a terminal. */
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2);
+  /* Tall enough to show context, capped so several cards stay visible. */
+  max-height: 260px;
+  overflow-y: auto;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  color: var(--fg-primary);
+}
+.work-card .console:empty { display: none; }
+.work-card.console-hidden .console { display: none; }
+
+.work-card .console-line {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.work-card .console-stage {
+  color: var(--accent);
+  margin: var(--space-2) 0 2px;
+  white-space: nowrap;
+}
+.work-card .console-stage:first-child { margin-top: 0; }

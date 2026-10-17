@@ -1,0 +1,689 @@
+import { afterEach, describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import fsp from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { assignCallSign } from './agentNames.js';
+import { consultationTelemetry } from './consultationTelemetry.js';
+
+// vitest.setup.ts points this at a temp path; restore it rather than deleting,
+// so a later suite in this worker never falls back to the real ~/.openswarm store.
+const ORIGINAL_COORDINATION_FILE = process.env.OPENSWARM_COORDINATION_FILE;
+// `ask_human` reads the durable trace so an answer survives the board's ring,
+// and that trace lives in the automation database vitest.setup points at one
+// path for the whole run — without a database per test, these suites see each
+// other's questions already answered.
+const ORIGINAL_AUTOMATION_DB = process.env.OPENSWARM_AUTOMATION_DB;
+let dir = '';
+afterEach(async () => {
+  (await import('./coordinationStore.js')).resetCoordinationStoreForTests();
+  (await import('./coordinationTrace.js')).resetTraceDbForTests();
+  process.env.OPENSWARM_COORDINATION_FILE = ORIGINAL_COORDINATION_FILE;
+  process.env.OPENSWARM_AUTOMATION_DB = ORIGINAL_AUTOMATION_DB;
+  if (dir) rmSync(dir, { recursive: true, force: true });
+});
+
+async function tools() {
+  dir = mkdtempSync(join(tmpdir(), 'osw-coordination-tools-'));
+  process.env.OPENSWARM_COORDINATION_FILE = join(dir, 'events.json');
+  process.env.OPENSWARM_AUTOMATION_DB = join(dir, 'automation.db');
+  (await import('./coordinationStore.js')).resetCoordinationStoreForTests();
+  (await import('./coordinationTrace.js')).resetTraceDbForTests();
+  return import('./coordinationTools.js');
+}
+
+describe('coordination tools', () => {
+  it('returns no peers without manufacturing advice traffic', async () => {
+    const mod = await tools();
+    const { getCoordinationStore } = await import('./coordinationStore.js');
+
+    const peers = JSON.parse((await mod.executeCoordinationTool('coordination_peers', {
+      task_ids: ['missing-dependency'], roles: ['reviewer'], limit: 3,
+    }, {
+      repository: '/repo', repoKey: 'git:repo', taskId: 'task-a', actor: 'worker-a', actorRole: 'worker',
+    })).content);
+
+    expect(peers).toEqual([]);
+    expect(getCoordinationStore().list({ repoKey: 'git:repo' })).toEqual([]);
+    expect(consultationTelemetry([])).toEqual({
+      requests: 0,
+      responses: 0,
+      acknowledgedResponses: 0,
+      threadLinkedRequests: 0,
+      crossTaskRequests: 0,
+      crossRoleRequests: 0,
+    });
+  });
+
+  it('delivers a request addressed by call sign to that agent only', async () => {
+    const mod = await tools();
+    const alice = assignCallSign({ repository: '/repo', executionId: 's1', role: 'worker' });
+    const bob = assignCallSign({ repository: '/repo', executionId: 's2', role: 'worker' });
+
+    await mod.executeCoordinationTool(
+      'coordination_publish',
+      { kind: 'advice-request', recipient: bob.name, summary: 'Is the auth helper safe to reuse?' },
+      { repository: '/repo', taskId: 't1', actor: alice.address, actorName: alice.name },
+    );
+
+    const stranger = assignCallSign({ repository: '/repo', executionId: 's3', role: 'worker' });
+    const unrelated = await mod.executeCoordinationTool('coordination_read', {}, {
+      repository: '/repo', taskId: 't1', actor: stranger.address, actorName: stranger.name,
+    });
+    expect(JSON.parse(unrelated.content)).toEqual([]);
+
+    const inbox = await mod.executeCoordinationTool('coordination_read', {}, {
+      repository: '/repo', taskId: 't1', actor: bob.address, actorName: bob.name,
+    });
+    const messages = JSON.parse(inbox.content);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({ actorName: alice.name, recipientName: bob.name, kind: 'advice-request' });
+  });
+
+  it('discovers bounded peers and delivers a cross-task reply exactly once after restart', async () => {
+    const mod = await tools();
+    const { getCoordinationStore, resetCoordinationStoreForTests } = await import('./coordinationStore.js');
+    const alice = assignCallSign({ repository: 'git:shared', executionId: 'task-a', role: 'worker' });
+    const bob = assignCallSign({ repository: 'git:shared', executionId: 'task-b', role: 'reviewer' });
+    const base = { repository: '/repo', repoKey: 'git:shared' };
+
+    // A lifecycle event is presence: peers are discovered from actual board
+    // activity, not from an unbounded global registry.
+    await getCoordinationStore().publish({
+      ...base, taskId: 'task-b', taskLabel: 'AGT-B', actor: bob.address,
+      actorName: bob.name, actorRole: 'reviewer', recipient: 'openswarm-daemon',
+      recipientRole: 'daemon', kind: 'delegation-request',
+      status: 'running', correlationId: 'presence-b', summary: 'reviewing task B',
+    });
+    await getCoordinationStore().publish({
+      ...base, taskId: 'task-a', taskLabel: 'AGT-A', actor: alice.address,
+      actorName: alice.name, actorRole: 'worker', recipient: 'openswarm-daemon',
+      recipientRole: 'daemon', kind: 'delegation-request', status: 'running',
+      correlationId: 'presence-a', summary: 'working on task A', timestamp: Date.now() + 1,
+    });
+    const peers = JSON.parse((await mod.executeCoordinationTool('coordination_peers', {
+      task_ids: ['task-b'], roles: ['reviewer'], limit: 1,
+    }, { ...base, taskId: 'task-a', actor: alice.address, actorRole: 'worker' })).content);
+    expect(peers).toEqual([expect.objectContaining({ address: bob.address, taskId: 'task-b', role: 'reviewer' })]);
+
+    const request = await mod.executeCoordinationTool('coordination_publish', {
+      kind: 'advice-request', recipient: bob.address, target_task_id: 'task-b', summary: 'Can these edits collide?',
+    }, { ...base, taskId: 'task-a', taskLabel: 'AGT-A', actor: alice.address, actorName: alice.name, actorRole: 'worker' });
+    expect(request.isError).toBe(false);
+    const [mail] = JSON.parse((await mod.executeCoordinationTool('coordination_read', {}, {
+      ...base, taskId: 'task-b', actor: bob.address, actorName: bob.name, actorRole: 'reviewer',
+    })).content);
+    expect(mail).toMatchObject({ sourceTaskId: 'task-a', targetTaskId: 'task-b' });
+
+    const reply = await mod.executeCoordinationTool('coordination_publish', {
+      kind: 'advice-response', recipient: alice.address, correlation_id: mail.correlationId, summary: 'Yes; keep file ownership separate.',
+    }, { ...base, taskId: 'task-b', taskLabel: 'AGT-B', actor: bob.address, actorName: bob.name, actorRole: 'reviewer' });
+    expect(reply.isError).toBe(false);
+
+    resetCoordinationStoreForTests();
+    const first = JSON.parse((await mod.executeCoordinationTool('coordination_read', {}, {
+      ...base, taskId: 'task-a', actor: alice.address, actorRole: 'worker',
+    })).content);
+    const second = JSON.parse((await mod.executeCoordinationTool('coordination_read', {}, {
+      ...base, taskId: 'task-a', actor: alice.address, actorRole: 'worker',
+    })).content);
+    expect(first.map((event: { summary: string }) => event.summary)).toContain('Yes; keep file ownership separate.');
+    expect(second).toEqual([]);
+  });
+
+  it('records a bounded cross-task/cross-role consultation through one durable thread', async () => {
+    const mod = await tools();
+    const { getCoordinationStore } = await import('./coordinationStore.js');
+    const store = getCoordinationStore();
+    const alice = assignCallSign({ repository: 'git:shared', executionId: 'task-a', role: 'worker' });
+    const bob = assignCallSign({ repository: 'git:shared', executionId: 'task-b', role: 'reviewer' });
+    const base = { repository: '/repo', repoKey: 'git:shared' };
+    const aliceContext = {
+      ...base, taskId: 'task-a', taskLabel: 'AGT-A', actor: alice.address,
+      actorName: alice.name, actorRole: 'worker',
+    };
+    const bobContext = {
+      ...base, taskId: 'task-b', taskLabel: 'AGT-B', actor: bob.address,
+      actorName: bob.name, actorRole: 'reviewer',
+    };
+
+    await store.publish({
+      ...base, taskId: 'task-a', taskLabel: 'AGT-A', actor: alice.address,
+      actorName: alice.name, actorRole: 'worker', recipient: 'openswarm-daemon',
+      recipientRole: 'daemon', kind: 'delegation-request', status: 'running',
+      correlationId: 'presence-a', summary: 'working on task A',
+    });
+    await store.publish({
+      ...base, taskId: 'task-b', taskLabel: 'AGT-B', actor: bob.address,
+      actorName: bob.name, actorRole: 'reviewer', recipient: 'openswarm-daemon',
+      recipientRole: 'daemon', kind: 'delegation-request', status: 'running',
+      correlationId: 'presence-b', summary: 'reviewing task B', timestamp: Date.now() + 1,
+    });
+
+    const peers = JSON.parse((await mod.executeCoordinationTool('coordination_peers', {
+      task_ids: ['task-b'], roles: ['reviewer'], limit: 3,
+    }, aliceContext)).content);
+    expect(peers).toEqual([expect.objectContaining({ address: bob.address, taskId: 'task-b', role: 'reviewer' })]);
+
+    const created = JSON.parse((await mod.executeCoordinationTool('coordination_thread_create', {
+      subject: 'Retry ownership', body: 'Will task B touch retry.ts?',
+      related_task_ids: ['task-b'], related_files: ['src/retry.ts'],
+      idempotency_key: 'consult-retry-owner',
+    }, aliceContext)).content);
+    const threadId = created.thread.id as string;
+    expect((await mod.executeCoordinationTool('coordination_thread_follow', {
+      thread_id: threadId, following: true,
+    }, bobContext)).isError).toBe(false);
+
+    const requested = await mod.executeCoordinationTool('coordination_publish', {
+      kind: 'advice-request', recipient: bob.address, target_task_id: 'task-b',
+      thread_id: threadId, summary: 'Will your retry edit overlap src/retry.ts?',
+    }, aliceContext);
+    expect(requested.isError).toBe(false);
+    const requestEvent = JSON.parse(requested.content).event;
+    expect(requestEvent.metadata).toMatchObject({
+      consultation: true, consultationPhase: 'request', threadId,
+      crossTask: true, crossRole: true, sourceRole: 'worker', targetRole: 'reviewer',
+    });
+
+    const bobInbox = JSON.parse((await mod.executeCoordinationTool('coordination_read', {}, bobContext)).content);
+    const requestMail = bobInbox.find((event: { kind: string }) => event.kind === 'advice-request');
+    expect(requestMail).toMatchObject({
+      correlationId: requestEvent.correlationId, sourceTaskId: 'task-a', targetTaskId: 'task-b',
+    });
+
+    const responded = await mod.executeCoordinationTool('coordination_publish', {
+      kind: 'advice-response', recipient: alice.address,
+      correlation_id: requestEvent.correlationId,
+      summary: 'No overlap; task B owns only src/reviewPolicy.ts.',
+    }, bobContext);
+    expect(responded.isError).toBe(false);
+    expect(JSON.parse(responded.content).event.metadata).toMatchObject({
+      consultation: true, consultationPhase: 'response', threadId,
+      crossTask: true, crossRole: true, sourceRole: 'reviewer', targetRole: 'worker',
+    });
+
+    const aliceInbox = JSON.parse((await mod.executeCoordinationTool('coordination_read', {}, aliceContext)).content);
+    expect(aliceInbox).toContainEqual(expect.objectContaining({
+      kind: 'advice-response', correlationId: requestEvent.correlationId,
+      summary: 'No overlap; task B owns only src/reviewPolicy.ts.',
+    }));
+
+    const acknowledged = await mod.executeCoordinationTool('coordination_thread_reply', {
+      thread_id: threadId,
+      body: 'Incorporated: task A keeps src/retry.ts; task B owns src/reviewPolicy.ts.',
+      acknowledges_correlation_id: requestEvent.correlationId,
+      idempotency_key: 'ack-retry-ownership',
+    }, aliceContext);
+    expect(acknowledged.isError).toBe(false);
+
+    const events = store.list({ repoKey: 'git:shared', limit: 500 });
+    expect(events).toContainEqual(expect.objectContaining({
+      kind: 'thread-update',
+      metadata: expect.objectContaining({
+        threadId, action: 'replied', acknowledgesCorrelationId: requestEvent.correlationId,
+      }),
+    }));
+    expect(consultationTelemetry(events)).toEqual({
+      requests: 1,
+      responses: 1,
+      acknowledgedResponses: 1,
+      threadLinkedRequests: 1,
+      crossTaskRequests: 1,
+      crossRoleRequests: 1,
+    });
+
+    const { queryTrace } = await import('./coordinationTrace.js');
+    const exchangeTrace = queryTrace({ repoKey: 'git:shared', correlationId: requestEvent.correlationId, limit: 10 });
+    expect(exchangeTrace.map((event) => event.metadata)).toEqual([
+      expect.objectContaining({ consultationPhase: 'request', threadId, crossTask: true, crossRole: true }),
+      expect.objectContaining({ consultationPhase: 'response', threadId, crossTask: true, crossRole: true }),
+    ]);
+    const durableAck = queryTrace({ repoKey: 'git:shared', taskId: 'task-a', limit: 100 })
+      .find((event) => event.metadata?.acknowledgesCorrelationId === requestEvent.correlationId);
+    expect(durableAck?.metadata).toMatchObject({ threadId, acknowledgesCorrelationId: requestEvent.correlationId });
+  });
+
+  it('rejects a self-authored response and counts only the original addressee topology', async () => {
+    const mod = await tools();
+    const { getCoordinationStore } = await import('./coordinationStore.js');
+    const alice = assignCallSign({ repository: '/repo', executionId: 'alice', role: 'worker' });
+    const bob = assignCallSign({ repository: '/repo', executionId: 'bob', role: 'reviewer' });
+    const base = { repository: '/repo', repoKey: 'git:repo', taskId: 'task-a' };
+    const request = JSON.parse((await mod.executeCoordinationTool('coordination_publish', {
+      kind: 'advice-request', recipient: bob.address, summary: 'Check the retry owner.',
+    }, { ...base, actor: alice.address, actorRole: 'worker' })).content).event;
+
+    const forged = await mod.executeCoordinationTool('coordination_publish', {
+      kind: 'advice-response', recipient: alice.address,
+      correlation_id: request.correlationId, summary: 'I approve myself.',
+    }, { ...base, actor: alice.address, actorRole: 'worker' });
+    expect(forged).toMatchObject({ isError: true });
+    expect(forged.content).toContain('original request addressee');
+
+    const valid = await mod.executeCoordinationTool('coordination_publish', {
+      kind: 'advice-response', recipient: alice.address,
+      correlation_id: request.correlationId, summary: 'Reviewer approves the ownership split.',
+    }, { ...base, actor: bob.address, actorRole: 'reviewer' });
+    expect(valid.isError).toBe(false);
+
+    const events = getCoordinationStore().list({ repoKey: 'git:repo', limit: 100 });
+    expect(consultationTelemetry(events)).toMatchObject({ requests: 1, responses: 1 });
+  });
+
+  it('denies cross-task publishing to an unknown or different-cell peer', async () => {
+    const mod = await tools();
+    const { getCoordinationStore } = await import('./coordinationStore.js');
+    await getCoordinationStore().publish({
+      repository: '/other', repoKey: 'git:other', taskId: 'task-b', actor: 'remote-reviewer',
+      actorRole: 'reviewer', kind: 'delegation-request', status: 'running', summary: 'elsewhere',
+    });
+    const denied = await mod.executeCoordinationTool('coordination_publish', {
+      kind: 'advice-request', recipient: 'remote-reviewer', target_task_id: 'task-b', summary: 'hello',
+    }, { repository: '/repo', repoKey: 'git:shared', taskId: 'task-a', actor: 'local-worker', actorRole: 'worker' });
+    expect(denied).toMatchObject({ isError: true });
+    expect(denied.content).toContain('not an active peer');
+  });
+
+  it('pages the operator instead of answering its own question', async () => {
+    const mod = await tools();
+    const paged: string[] = [];
+    const result = await mod.executeCoordinationTool('ask_human', { question: 'Ship v2?' }, {
+      repository: '/repo', taskId: 't1', actor: 'magos-test', actorName: 'Magos Test-Vector',
+      notifyOperator: async (message) => { paged.push(message); return true; },
+    });
+    const payload = JSON.parse(result.content);
+    expect(payload).toMatchObject({ blocked: true, delivered: true });
+    expect(payload.correlationId).toMatch(/^hq-/);
+    expect(paged[0]).toContain('Ship v2?');
+  });
+
+  it('tells the agent nobody was paged when Discord is unreachable', async () => {
+    const mod = await tools();
+    const result = await mod.executeCoordinationTool('ask_human', { question: 'Ship v3?' }, {
+      repository: '/repo', taskId: 't1', actor: 'magos-test',
+      notifyOperator: async () => false,
+    });
+    const payload = JSON.parse(result.content);
+    expect(payload.delivered).toBe(false);
+    expect(payload.instruction).toContain('nobody has been paged');
+  });
+
+  // AGT-4514: the class the agent supplies decides whether an automated
+  // responder may answer, so it has to survive the tool boundary intact.
+  it('stamps approval on ask_human when no class is supplied', async () => {
+    const mod = await tools();
+    const { getCoordinationStore } = await import('./coordinationStore.js');
+    const result = await mod.executeCoordinationTool('ask_human', { question: 'Ship v4?' }, {
+      repository: '/repo', taskId: 't-cls', actor: 'magos-test', notifyOperator: async () => true,
+    });
+    const { correlationId } = JSON.parse(result.content);
+    expect(getCoordinationStore().exchange(correlationId)[0].metadata?.questionClass).toBe('approval');
+  });
+
+  it('stamps clarification through the tool and admits an automated answer to it', async () => {
+    const mod = await tools();
+    const { getCoordinationStore } = await import('./coordinationStore.js');
+    const h = await import('./humanQuestions.js');
+    const result = await mod.executeCoordinationTool('ask_human', {
+      question: 'Which staging DSN?', class: 'clarification',
+    }, {
+      repository: '/repo', taskId: 't-cls2', actor: 'magos-test', notifyOperator: async () => true,
+    });
+    const { correlationId } = JSON.parse(result.content);
+    expect(getCoordinationStore().exchange(correlationId)[0].metadata?.questionClass).toBe('clarification');
+    expect((await h.answerHumanQuestion(correlationId, 'staging-dsn', 'hermes-connector')).accepted).toBe(true);
+  });
+
+  // AGT-4516: an advisor answer reaches the agent marked as automated advice.
+  it('marks an advisor answer as automated when ask_human returns it', async () => {
+    const mod = await tools();
+    const h = await import('./humanQuestions.js');
+    const context = { repository: '/repo', taskId: 't-adv', actor: 'magos-test', notifyOperator: async () => true };
+    const args = { question: 'Which test runner?', class: 'clarification' };
+    const first = JSON.parse((await mod.executeCoordinationTool('ask_human', args, context)).content);
+    expect((await h.answerHumanQuestion(first.correlationId, 'vitest', 'advisor:hermes', 'advisor')).accepted).toBe(true);
+
+    const again = JSON.parse((await mod.executeCoordinationTool('ask_human', args, context)).content);
+    expect(again).toMatchObject({ blocked: false, answer: 'vitest', answeredBy: 'advisor:hermes' });
+    expect(again.note).toContain('not a human');
+  });
+});
+
+// An agent that waited for a reply used to be killed for waiting: three checks
+// of a quiet inbox looked exactly like a stalled model. (AGT-4065)
+describe('coordination_wait', () => {
+  it('reports an unreadable board instead of an empty inbox', async () => {
+    // A board that cannot be read is not a board with no mail. Returning []
+    // would let an agent conclude nobody answered and proceed. (Caught by the
+    // commit-gate review.)
+    const mod = await tools();
+    const store = { consume: async () => { throw new Error('EACCES coordination.json'); } };
+    await expect(mod.waitForInbox(store, { repository: '/repo', taskId: 't1', actor: 'a' }, 120))
+      .rejects.toThrow(/Coordination board unavailable.*EACCES/);
+  });
+
+  it('still reports an empty inbox as empty when the board is readable', async () => {
+    const mod = await tools();
+    const store = { consume: async () => [] as unknown[] };
+    await expect(mod.waitForInbox(store, { repository: '/repo', taskId: 't1', actor: 'a' }, 120))
+      .resolves.toEqual([]);
+  });
+
+  it('does not fail the wait for a transient read error that later succeeds', async () => {
+    const mod = await tools();
+    let call = 0;
+    const store = {
+      consume: async () => {
+        call += 1;
+        if (call === 1) throw new Error('transient');
+        return [];
+      },
+    };
+    // The 2s re-drain gives the second attempt a chance before the deadline.
+    await expect(mod.waitForInbox(store, { repository: '/repo', taskId: 't1', actor: 'a' }, 3_000))
+      .resolves.toEqual([]);
+  }, 10_000);
+
+  it('reports a board that broke after its first successful read, not an empty inbox', async () => {
+    // The mirror of the transient case, and the one that bites: the first
+    // drain succeeds empty, then the board becomes unreadable for the rest of
+    // the wait. Tracking "any drain ever succeeded" called that a clean empty
+    // inbox — but that first read says nothing about the seconds that followed
+    // it, during which a reply could have landed unseen. The LAST observation
+    // is what an empty list has to rest on. (Caught by the fresh PR review.)
+    const mod = await tools();
+    let call = 0;
+    const store = {
+      consume: async () => {
+        call += 1;
+        if (call === 1) return [] as unknown[];
+        throw new Error('EACCES board went away');
+      },
+    };
+    await expect(mod.waitForInbox(store, { repository: '/repo', taskId: 't1', actor: 'a' }, 3_000))
+      .rejects.toThrow(/Coordination board unavailable.*EACCES/);
+  }, 10_000);
+
+  it('wakes for a publisher the in-process hub cannot see', async () => {
+    // `openswarm attach` and the CLI write to the board file from their own
+    // processes, where an in-memory emitter never fires. Without a slow
+    // re-drain the wait would silently always time out for exactly the
+    // operator path it exists to serve. Simulate by writing through the store
+    // with the hub deafened. (Caught by the commit-gate review.)
+    const mod = await tools();
+    const alice = assignCallSign({ repository: '/repo', executionId: 'w-xp', role: 'worker' });
+    const bob = assignCallSign({ repository: '/repo', executionId: 'w-xp-b', role: 'reviewer' });
+    const { getEventHub } = await import('../core/eventHub.js');
+    const hub = getEventHub();
+    const opened = JSON.parse((await mod.executeCoordinationTool(
+      'coordination_publish',
+      { kind: 'advice-request', recipient: bob.address, summary: 'please answer from another process' },
+      { repository: '/repo', taskId: 't1', actor: alice.address },
+    )).content);
+
+    const waiting = mod.executeCoordinationTool(
+      'coordination_wait', { timeout_ms: 8_000 },
+      { repository: '/repo', taskId: 't1', actor: alice.address },
+    );
+    setTimeout(() => {
+      // Deafen the hub for this publish, so only the re-drain can notice.
+      const listeners = hub.listeners('coordination:published');
+      hub.removeAllListeners('coordination:published');
+      void mod.executeCoordinationTool(
+        'coordination_publish',
+        {
+          kind: 'advice-response', recipient: alice.address,
+          correlation_id: opened.event.correlationId, summary: 'from another process',
+        },
+        { repository: '/repo', taskId: 't1', actor: bob.address },
+      ).then(() => {
+        for (const l of listeners) hub.on('coordination:published', l as () => void);
+      });
+    }, 30);
+
+    const events = JSON.parse((await waiting).content) as Array<{ summary: string }>;
+    expect(events.map((e) => e.summary)).toContain('from another process');
+  }, 15_000);
+
+  it('does not drop a wake-up that arrives while a drain is in flight', async () => {
+    // The window is milliseconds wide against the real store, so drive it with
+    // a fake: the first drain is still running when the event fires. Guarding
+    // the drain without remembering the wake-up left that message waiting for
+    // the next poll — or forever, if nothing else was ever published.
+    const mod = await tools();
+    const { getEventHub } = await import('../core/eventHub.js');
+    const hub = getEventHub();
+    let call = 0;
+    const store = {
+      consume: async () => {
+        call += 1;
+        if (call === 1) {
+          // Fire the wake-up mid-drain, then finish this drain empty.
+          setTimeout(() => hub.emit('coordination:published', {}), 5);
+          await new Promise((r) => setTimeout(r, 40));
+          return [];
+        }
+        return [{ summary: 'landed mid-drain' }];
+      },
+    };
+
+    const started = Date.now();
+    const events = await mod.waitForInbox(
+      store, { repository: '/repo', taskId: 't1', actor: 'a' }, 5_000,
+    ) as Array<{ summary: string }>;
+    expect(events.map((e) => e.summary)).toContain('landed mid-drain');
+    // Well under the 2s re-drain interval: the wake-up itself has to be what
+    // produced the second drain.
+    expect(Date.now() - started).toBeLessThan(1_500);
+  });
+
+  it('returns at the deadline when nothing arrives', async () => {
+    const mod = await tools();
+    const alice = assignCallSign({ repository: '/repo', executionId: 'w-quiet', role: 'worker' });
+    const started = Date.now();
+    const result = await mod.executeCoordinationTool(
+      'coordination_wait',
+      { timeout_ms: 120 },
+      { repository: '/repo', taskId: 't1', actor: alice.address },
+    );
+    expect(JSON.parse(result.content)).toEqual([]);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(100);
+  });
+
+  it('returns as soon as a message addressed to the agent arrives', async () => {
+    const mod = await tools();
+    const alice = assignCallSign({ repository: '/repo', executionId: 'w-a', role: 'worker' });
+    const bob = assignCallSign({ repository: '/repo', executionId: 'w-b', role: 'reviewer' });
+    const opened = JSON.parse((await mod.executeCoordinationTool(
+      'coordination_publish',
+      { kind: 'advice-request', recipient: bob.address, summary: 'please answer' },
+      { repository: '/repo', taskId: 't1', actor: alice.address },
+    )).content);
+
+    const started = Date.now();
+    // A generous deadline: the point is that it returns long before it.
+    const waiting = mod.executeCoordinationTool(
+      'coordination_wait',
+      { timeout_ms: 5_000 },
+      { repository: '/repo', taskId: 't1', actor: alice.address },
+    );
+    setTimeout(() => {
+      void mod.executeCoordinationTool(
+        'coordination_publish',
+        {
+          kind: 'advice-response', recipient: alice.address,
+          correlation_id: opened.event.correlationId, summary: 'here is the answer',
+        },
+        { repository: '/repo', taskId: 't1', actor: bob.address },
+      );
+    }, 30);
+
+    const events = JSON.parse((await waiting).content) as Array<{ summary: string }>;
+    expect(events.map((e) => e.summary)).toContain('here is the answer');
+    expect(Date.now() - started).toBeLessThan(4_000);
+  });
+
+  it('does not lose a message that landed before the wait began', async () => {
+    // Waiting must not be a way to miss mail: anything that arrived since the
+    // agent's last read has to come back on the first drain.
+    const mod = await tools();
+    const alice = assignCallSign({ repository: '/repo', executionId: 'w-pre', role: 'worker' });
+    const bob = assignCallSign({ repository: '/repo', executionId: 'w-pre-b', role: 'reviewer' });
+    await mod.executeCoordinationTool(
+      'coordination_publish',
+      { kind: 'advice-request', recipient: alice.address, summary: 'sent earlier' },
+      { repository: '/repo', taskId: 't1', actor: bob.address },
+    );
+    const result = await mod.executeCoordinationTool(
+      'coordination_wait', { timeout_ms: 50 },
+      { repository: '/repo', taskId: 't1', actor: alice.address },
+    );
+    expect((JSON.parse(result.content) as Array<{ summary: string }>).map((e) => e.summary)).toContain('sent earlier');
+  });
+
+  it('clamps a requested wait to something a stage can afford', async () => {
+    const { resolveWaitMs, COORDINATION_WAIT_MAX_MS, COORDINATION_WAIT_DEFAULT_MS } =
+      await import('./coordinationTools.js');
+    // Worker stages get 20 min and the agentic loop 5 — a wait must never be a
+    // way to burn that budget and fail the stage as infra_error.
+    expect(resolveWaitMs(60 * 60_000)).toBe(COORDINATION_WAIT_MAX_MS);
+    // The fixed ceiling is not enough on its own: a loop with seconds left
+    // would still grant a full-length wait and then time out instead of
+    // returning the answer that was about to arrive.
+    const now = 1_000_000;
+    const { COORDINATION_WAIT_LOOP_MARGIN_MS } = await import('./coordinationTools.js');
+    expect(resolveWaitMs(60_000, now + 20_000, now)).toBe(20_000 - COORDINATION_WAIT_LOOP_MARGIN_MS);
+    // Past the deadline already: nothing left to spend.
+    expect(resolveWaitMs(60_000, now + 1_000, now)).toBe(0);
+    // A generous loop deadline does not raise the fixed ceiling.
+    expect(resolveWaitMs(60 * 60_000, now + 60 * 60_000, now)).toBe(COORDINATION_WAIT_MAX_MS);
+    expect(resolveWaitMs(undefined)).toBe(COORDINATION_WAIT_DEFAULT_MS);
+    expect(resolveWaitMs('soon')).toBe(COORDINATION_WAIT_DEFAULT_MS);
+    expect(resolveWaitMs(-5)).toBe(0);
+    expect(resolveWaitMs(1_500)).toBe(1_500);
+  });
+
+  it('is dispatchable — the adapter derives its tool names from the definitions', async () => {
+    const { COORDINATION_TOOL_NAMES, COORDINATION_TOOL_DEFINITIONS } = await import('./coordinationTools.js');
+    // The adapter used to keep a hardcoded copy of this list, so a new tool was
+    // defined, advertised, and then silently undispatchable. The dispatch set
+    // may additionally contain role-scoped tools that are advertised only to
+    // an orchestrator through mcpTools; every globally advertised definition
+    // must still be executable.
+    expect(COORDINATION_TOOL_NAMES.has('coordination_wait')).toBe(true);
+    for (const definition of COORDINATION_TOOL_DEFINITIONS) {
+      expect(COORDINATION_TOOL_NAMES.has(definition.function.name)).toBe(true);
+    }
+    expect(COORDINATION_TOOL_NAMES.has('tracker_save_comment')).toBe(true);
+    expect(COORDINATION_TOOL_NAMES.has('host_read_file')).toBe(true);
+  });
+});
+
+// Unref'd timers let a process whose only pending handles are those timers
+// exit mid-wait, and the awaited promise simply never resolves. Nothing
+// in-process can observe that — vitest's own worker always has other handles —
+// so drive a real child. (Caught by the PR review; AGT-4065)
+describe('a wait keeps its process alive until it settles', () => {
+  it('resolves in a child process with nothing else pending', async () => {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const run = promisify(execFile);
+    const scriptDir = mkdtempSync(join(tmpdir(), 'osw-wait-alive-'));
+    const script = join(scriptDir, 'probe.mts');
+    await fsp.writeFile(script, [
+      `import { waitForInbox } from ${JSON.stringify(join(process.cwd(), 'src/coordination/coordinationTools.ts'))};`,
+      'const store = { consume: async () => [] };',
+      'const started = Date.now();',
+      "const events = await waitForInbox(store, { repository: '/r', taskId: 't', actor: 'a' }, 1200);",
+      "console.log('SETTLED', JSON.stringify(events), Date.now() - started >= 1000);",
+    ].join('\n'), 'utf-8');
+
+    try {
+      // CI captures the child's stdout through a pipe (no TTY), so chalk leaves
+      // `true` bare; on a developer terminal the same line arrives wrapped in
+      // ANSI colour (e.g. \x1B[33mtrue\x1B[39m) and the bare-substring match
+      // fails. Force colour off in the child so the captured text is identical
+      // in both environments and the assertion tests the behaviour (the wait
+      // settled) rather than how the child rendered it.
+      const { stdout } = await run(
+        process.execPath,
+        [join(process.cwd(), 'node_modules/tsx/dist/cli.mjs'), script],
+        {
+          cwd: process.cwd(),
+          timeout: 60_000,
+          env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+        },
+      );
+      // Without the fix the child exits silently and this never appears.
+      expect(stdout).toContain('SETTLED [] true');
+    } finally {
+      rmSync(scriptDir, { recursive: true, force: true });
+    }
+  }, 90_000);
+});
+
+describe('the deadline does not throw away mail a drain was collecting', () => {
+  it('returns a message whose drain outlived the timeout', async () => {
+    // `consume` is destructive: it marks what it returns as seen. Resolving []
+    // while a drain was in flight consumed the message and discarded it — the
+    // agent saw "nobody answered" for mail that had arrived.
+    // (Caught by the PR review; AGT-4065)
+    const mod = await tools();
+    const store = {
+      consume: async () => {
+        await new Promise((r) => setTimeout(r, 300));
+        return [{ summary: 'arrived just before the deadline' }];
+      },
+    };
+    const events = await mod.waitForInbox(
+      store, { repository: '/r', taskId: 't', actor: 'a' }, 80,
+    ) as Array<{ summary: string }>;
+    expect(events.map((e) => e.summary)).toContain('arrived just before the deadline');
+  }, 10_000);
+
+  it('still settles under a stream of wake-ups after the deadline', async () => {
+    // The post-expiry catch-up is bounded by detaching the wake-up sources at
+    // the deadline. Without that, continuous publishing keeps re-arming the
+    // catch-up and the wait never returns.
+    const mod = await tools();
+    const { getEventHub } = await import('../core/eventHub.js');
+    const noise = setInterval(() => getEventHub().emit('coordination:published', {}), 10);
+    const store = {
+      consume: async () => { await new Promise((r) => setTimeout(r, 30)); return [] as unknown[]; },
+    };
+    try {
+      const started = Date.now();
+      await expect(mod.waitForInbox(store, { repository: '/r', taskId: 't', actor: 'a' }, 100))
+        .resolves.toEqual([]);
+      expect(Date.now() - started).toBeLessThan(3_000);
+    } finally {
+      clearInterval(noise);
+    }
+  }, 10_000);
+
+  it('honours a wake-up recorded during the drain that outlived the deadline', async () => {
+    // The message was published BEFORE the deadline; only its delivery landed
+    // after. Dropping the recorded wake-up reported an empty inbox for mail
+    // that had already arrived. (Caught by the PR review; AGT-4065)
+    const mod = await tools();
+    const { getEventHub } = await import('../core/eventHub.js');
+    let call = 0;
+    const store = {
+      consume: async () => {
+        call += 1;
+        if (call === 1) {
+          setTimeout(() => getEventHub().emit('coordination:published', {}), 20);
+          await new Promise((r) => setTimeout(r, 200));
+          return [];
+        }
+        return [{ summary: 'published before the deadline' }];
+      },
+    };
+    const events = await mod.waitForInbox(
+      store, { repository: '/r', taskId: 't', actor: 'a' }, 80,
+    ) as Array<{ summary: string }>;
+    expect(events.map((e) => e.summary)).toContain('published before the deadline');
+  }, 10_000);
+
+});

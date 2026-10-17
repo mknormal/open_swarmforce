@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>SWARMFORGE · Cockpit</title>
+  <script src="/static/js/themeBoot.js"></script>
+  <script src="/static/js/webToken.js"></script>
+  <link rel="stylesheet" href="/static/css/tokens.css" />
+  <link rel="stylesheet" href="/static/css/shell.css" />
+  <link rel="stylesheet" href="/static/css/cockpit.css" />
+  <link rel="stylesheet" href="/static/css/app.css" />
+</head>
+<body class="page-cockpit" data-view="issues">
+  <header class="topbar">
+    <button id="sidebar-toggle" class="btn btn-ghost btn-icon sidebar-toggle" type="button" aria-label="Toggle sidebar" aria-expanded="false" aria-controls="sidebar">☰</button>
+    <a class="brand" href="/app"><svg class="brand-mark" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" focusable="false"><path d="M12 2.5 20.5 7.4v9.2L12 21.5 3.5 16.6V7.4Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M12 7.8 16.2 15.4H7.8Z" fill="currentColor"/></svg><span class="brand-wordmark">SWARMFORGE</span></a>
+    <span class="page-title">Cockpit</span>
+    <nav class="topbar-nav" aria-label="Pages">
+      <a href="/app" aria-current="page">Cockpit</a>
+      <a href="/chat">Chat</a>
+      <a href="/orchestration">Orchestration</a>
+      <a href="/threads">Threads</a>
+      <a href="/warehouse">Warehouse</a>
+      <a href="/usage">Usage</a>
+      <a href="/">Supervisor</a>
+    </nav>
+    <div class="topbar-spacer"></div>
+    <div class="topbar-actions">
+      <button type="button" id="theme-toggle" class="btn btn-ghost btn-icon theme-toggle" aria-label="Switch theme" aria-pressed="false">
+        <span class="when-dark" aria-hidden="true">☾</span><span class="when-light" aria-hidden="true">☀</span>
+      </button>
+    </div>
+  </header>
+
+  <aside id="sidebar" class="sidebar" aria-label="Views and sessions">
+    <nav class="view-nav" aria-label="Views">
+      <button type="button" class="nav-item" data-view="sessions">Sessions</button>
+      <button type="button" class="nav-item" data-view="issues">Issues</button>
+    </nav>
+    <div class="sidebar-section-head">Repository</div>
+    <div id="repo-picker" class="repo-picker"></div>
+    <div id="session-tree" class="session-tree"></div>
+  </aside>
+
+  <main class="main">
+    <section class="view view-issues" data-view-panel="issues">
+      <div class="panel issues-panel">
+        <div class="panel-head">
+          <h2>Issues</h2>
+          <span id="issue-count" class="muted"></span>
+        </div>
+        <div id="issue-list" class="issue-list">
+          <div class="empty">Select a repository to load its issues.</div>
+        </div>
+        <footer class="deploy-bar">
+          <span id="selection-summary" class="muted" role="status" aria-live="polite">0 selected</span>
+          <button id="deploy-btn" class="btn btn-primary deploy-btn" disabled>Deploy agents</button>
+        </footer>
+      </div>
+
+      <div class="panel work-panel">
+        <div class="panel-head">
+          <h2>Active work</h2>
+        </div>
+        <div id="work-cards" class="work-cards">
+          <div class="empty">Deployed agents will report progress here.</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="view view-sessions" data-view-panel="sessions">
+      <div class="panel session-panel">
+        <div class="panel-head">
+          <h2>Sessions</h2>
+          <span id="session-count" class="muted"></span>
+        </div>
+        <div id="session-body" class="session-body">
+          <div class="empty">Deploy issues to start a session. Live agent output appears here.</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="statusbar">
+    <div id="quota-gauge" class="quota-gauge" title="provider rate limit — observed from usage headers" hidden></div>
+    <div class="spacer"></div>
+    <div id="daemon-status" class="daemon-status" title="daemon">
+      <span class="dot" data-state="unknown"></span>
+      <span class="label">connecting…</span>
+    </div>
+  </footer>
+
+  <script type="module" src="/static/js/main.mjs"></script>
+</body>
+</html>

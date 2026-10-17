@@ -1,0 +1,213 @@
+import { describe, expect, it } from 'vitest';
+import { citedPathsAreEphemeral, ephemeralPathspecRoots, isEphemeralWorktreeArtifact, isAgentScratchFile } from './worktreeEphemeral.js';
+
+describe('isEphemeralWorktreeArtifact', () => {
+  // cgf-portal#207 (2026-09-02) shipped `apps/pipelines/.coverage`: the repo
+  // ignores only `coverage/`, so pytest-cov's data file was trackable and the
+  // WIP preserve committed it.
+  it('drops Python test-run output at any depth', () => {
+    for (const file of [
+      '.coverage',
+      'apps/pipelines/.coverage',
+      'apps/pipelines/.coverage.runner.12345.XyZ',
+      'apps/pipelines/.full-pytest.status',
+      '.pytest_cache/v/cache/nodeids',
+      'src/pkg/__pycache__/mod.cpython-312.pyc',
+      'htmlcov/index.html',
+      '.hypothesis/examples/abc',
+    ]) {
+      expect(isEphemeralWorktreeArtifact(file), file).toBe(true);
+    }
+  });
+
+  it('keeps source that merely resembles test output', () => {
+    for (const file of [
+      'src/coverage.ts',
+      'docs/coverage-report.md',
+      'tests/test_loader.py',
+      'apps/pipelines/src/cgf_pipelines/a3_messaging.py',
+      'coverage/README.md',
+    ]) {
+      expect(isEphemeralWorktreeArtifact(file), file).toBe(false);
+    }
+  });
+
+  it('still recognises the worktree-level scratch it always did', () => {
+    expect(isEphemeralWorktreeArtifact('.venv')).toBe(true);
+    expect(isEphemeralWorktreeArtifact('pytest-of-openswarm/pytest-3/x')).toBe(true);
+    expect(isEphemeralWorktreeArtifact('pytest-local/test_case_current')).toBe(true);
+    expect(isEphemeralWorktreeArtifact('.trash/AX-1/pytest-a3/out')).toBe(true);
+  });
+
+  // cgf-portal AX-868 (2026-09-02): a worker ran `uv venv .venv_test` and the
+  // publication commit tracked 11,026 files under it. The purge commit that
+  // followed removed nothing because only the bare `.venv` link was known, so
+  // every later attempt died on the publication fence.
+  it('drops any virtualenv directory by name, at any depth', () => {
+    for (const file of [
+      '.venv_test/bin/activate',
+      '.venv_test/pyvenv.cfg',
+      '.venv/lib/python3.12/site-packages/x.py',
+      '.venv-verify/bin/ruff',
+      '.venv.bak/bin/python',
+      'venv/bin/python',
+      'apps/pipelines/.venv/pyvenv.cfg',
+      '.test_venv/lib/python3.11/site-packages/_pytest/_code/code.py',
+      'test_venv/pyvenv.cfg',
+      '.test_venv',
+      'test_venv',
+      '.venv',
+      'venv',
+    ]) {
+      expect(isEphemeralWorktreeArtifact(file), file).toBe(true);
+    }
+    for (const file of ['src/venv_tools.py', 'docs/venv.md', 'convenv/x.py', 'src/env/config.py']) {
+      expect(isEphemeralWorktreeArtifact(file), file).toBe(false);
+    }
+  });
+});
+
+describe('ephemeralPathspecRoots', () => {
+  it('collapses pytest basetemp paths to their root and keeps single files', () => {
+    expect(ephemeralPathspecRoots([
+      'pytest-of-openswarm/pytest-3/a', 'pytest-of-openswarm/pytest-3/b', 'apps/pipelines/.coverage',
+    ])).toEqual(['apps/pipelines/.coverage', 'pytest-of-openswarm']);
+  });
+
+  it('collapses a virtualenv to its directory so the purge is one rm -r', () => {
+    expect(ephemeralPathspecRoots([
+      '.venv_test/bin/activate', '.venv_test/lib/python3.12/site-packages/a.py', 'apps/x/.venv/pyvenv.cfg', '.venv',
+    ])).toEqual(['.venv', '.venv_test', 'apps/x/.venv']);
+  });
+});
+
+describe('citedPathsAreEphemeral', () => {
+  it('treats a BS-guard dump that only names .test_venv as ephemeral', () => {
+    const detail = 'Pipeline guard failed: [WARNING] .test_venv/lib/python3.11/site-packages/_pytest/_code/code.py:98 — TODO/FIXME';
+    expect(citedPathsAreEphemeral(detail)).toBe(true);
+  });
+
+  it('treats a publication-scope list that is only pytest-local as ephemeral', () => {
+    const detail = 'publication-scope: branch contains files outside reserved write scope: pytest-local/test_all_zero_token_samples_recurrent.py';
+    expect(citedPathsAreEphemeral(detail)).toBe(true);
+  });
+
+  it('does not treat a mixed source + venv failure as ephemeral', () => {
+    const detail = '[WARNING] src/ci_guard.py:12 — TODO/FIXME; [WARNING] .test_venv/lib/x.py:1 — TODO/FIXME';
+    expect(citedPathsAreEphemeral(detail)).toBe(false);
+  });
+
+  it('does not treat an operator-question park as ephemeral', () => {
+    expect(citedPathsAreEphemeral('[operator-question] asked 2 times with no answer — stopped retrying automatically')).toBe(false);
+  });
+});
+
+describe('agent-runtime scratch (2026-09-10)', () => {
+  // Seven shapes reached main or an open PR before this existed. Each is
+  // something the AGENT wrote into the worktree it was handed, and each was
+  // swept in by a worker's `git add -A`.
+  it.each([
+    ['node_modules', 'symlink to the shared install; a checkout that gets it cannot npm ci'],
+    ['apps/portal/node_modules', 'the same, in a monorepo package — cgf-portal AX-1485 (2026-09-19)'],
+    ['cli.json', 'cursor-agent permission allow-list granting Shell(**)'],
+    ['cursor/cli.json', 'the same, under its own directory'],
+    ['.run-tests.sh', 'generated runner with a hardcoded container worktree UUID'],
+    ['.tmp-run-dod-tests.sh', 'the same, different name'],
+    ['.run-targeted-tests.mjs', 'the same, different extension'],
+    ['.test-runner-tmp.sh', 'agent-written test runner'],
+    ['.cursor-review-git-dump.py', 'agent-written state dump'],
+  ])('treats %s as ephemeral (%s)', (file) => {
+    expect(isEphemeralWorktreeArtifact(file)).toBe(true);
+  });
+
+  it('does not swallow real source that merely resembles them', () => {
+    // The patterns are anchored on purpose: a repository may legitimately track
+    // a `src/cursor/` module, a `run-tests.sh` without the leading dot, or a
+    // `node_modules` path nested under a fixture directory.
+    for (const file of [
+      'run-tests.sh',
+      'scripts/run-deploy.sh',
+      'src/cursorTracker.ts',
+      'tests/fixtures/node_modules/pkg/index.js',
+      'src/cli.json.ts',
+    ]) {
+      expect(isEphemeralWorktreeArtifact(file)).toBe(false);
+    }
+  });
+
+  it('sweeps the dotless runner spelling, which reached main once', () => {
+    // #604 landed `tmp-run-memory-tests.sh` on main. Every rule here assumed a
+    // leading dot, so the same script under a one-character-different name
+    // walked straight past both this predicate and .gitignore.
+    expect(isEphemeralWorktreeArtifact('tmp-run-memory-tests.sh')).toBe(true);
+    expect(isEphemeralWorktreeArtifact('tmp-run-focused.mjs')).toBe(true);
+    expect(isEphemeralWorktreeArtifact('sub/dir/tmp-run-x.js')).toBe(true);
+  });
+
+  it('leaves a project file that merely starts the same way', () => {
+    // The rule matches `tmp-run-` at a path root with a script extension, so a
+    // source file that happens to share the prefix is not swept.
+    expect(isEphemeralWorktreeArtifact('src/tmp-runner.ts')).toBe(false);
+    expect(isEphemeralWorktreeArtifact('tmp-run-notes.md')).toBe(false);
+    expect(isEphemeralWorktreeArtifact('docs/tmp-run-guide.txt')).toBe(false);
+  });
+
+});
+
+describe('isAgentScratchFile (AGT-4410)', () => {
+  it('names the two shapes that reached cgf-portal PRs and their neighbours', () => {
+    for (const file of [
+      '_apply_edit.py',
+      'apps/pipelines/_apply_fix.sh',
+      'scripts/check_migration_immutability.py.bak',
+      'src/a.ts.orig',
+      'src/a.ts.rej',
+      'docs/notes.md~',
+      '.DS_Store',
+      'apps/portal/.DS_Store',
+    ]) {
+      expect(isAgentScratchFile(file), file).toBe(true);
+    }
+  });
+
+  it('leaves source that merely resembles scratch alone', () => {
+    for (const file of [
+      'src/apply_edit.py',            // no leading underscore
+      'src/backup.ts',                // "bak" is not an extension here
+      'fixtures/original.json',
+      'apps/portal/src/rejected_orders.py',
+      'scripts/_apply_edit.md',       // not a script
+      'src/tilde~/x.ts',              // ~ mid-path, not a trailing backup marker
+    ]) {
+      expect(isAgentScratchFile(file), file).toBe(false);
+    }
+  });
+
+  // cgf-portal#572, 2026-09-19: the worker's own one-off `fix_cafe24.py` and
+  // `fix_tests.py` (string-replace apply scripts, never imported) landed in a
+  // new top-level `scratchpad/` directory and reached the real PR — a
+  // constitution gate rejected the new top-level directory, and a person
+  // removed them by hand in a follow-up commit. `_apply_*` did not match this
+  // shape: the worker did not use that name.
+  it('names a one-off script the worker left in its own scratchpad directory', () => {
+    for (const file of [
+      'scratchpad/fix_cafe24.py',
+      'scratchpad/fix_tests.py',
+      'apps/pipelines/scratchpad/patch.sh',
+    ]) {
+      expect(isAgentScratchFile(file), file).toBe(true);
+    }
+  });
+
+  it('leaves non-script content in a scratchpad directory alone', () => {
+    // Real, useful content the worker meant to keep — just filed in the wrong
+    // place. Not junk on its own; a scope/placement concern, not a scratch one.
+    expect(isAgentScratchFile('scratchpad/land_records_survey.md')).toBe(false);
+  });
+
+  it('is not folded into the runtime-artifact predicate, which also purges tracked files', () => {
+    // A repository may legitimately track a .bak; the purge on a resumed branch
+    // must not delete it. Only additions are filtered, by the staging step.
+    expect(isEphemeralWorktreeArtifact('config/prod.yaml.bak')).toBe(false);
+  });
+});

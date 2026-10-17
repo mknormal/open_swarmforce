@@ -1,0 +1,1173 @@
+// ============================================
+// OpenSwarm - Canonical Task State Store
+// ============================================
+
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
+import { randomUUID } from 'node:crypto';
+import Database from 'better-sqlite3';
+import { z } from 'zod';
+import type { TaskItem } from '../orchestration/decisionEngine.js';
+import { isProofCapableSpace, processAppearsAlive, processNamespaceId, sameProcessNamespace, writerProvablyGone } from '../support/processLiveness.js';
+import { getInstanceId } from '../support/healthEndpoint.js';
+
+const TASK_STATE_MARKER = '<!-- openswarm:task-state:v1 -->';
+
+const TaskExecutionStatusSchema = z.enum([
+  'backlog',
+  'todo',
+  'ready',
+  'blocked',
+  'in_progress',
+  'in_review',
+  'decomposed',
+  'done',
+  'failed',
+  'halted',
+]);
+
+const WorktreeStateSchema = z.object({
+  branchName: z.string().optional(),
+  worktreePath: z.string().optional(),
+  ownerAgent: z.string().optional(),
+  leaseExpiresAt: z.string().optional(),
+});
+
+const ExecutionStateSchema = z.object({
+  status: TaskExecutionStatusSchema.default('backlog'),
+  blockedReason: z.string().optional(),
+  retryCount: z.number().int().nonnegative().default(0),
+  confidence: z.number().min(0).max(1).optional(),
+  lastSessionId: z.string().optional(),
+});
+
+export const OpenSwarmTaskStateSchema = z.object({
+  version: z.literal(1).default(1),
+  issueId: z.string(),
+  issueIdentifier: z.string().optional(),
+  title: z.string().optional(),
+  projectId: z.string().optional(),
+  projectName: z.string().optional(),
+  parentIssueId: z.string().optional(),
+  childIssueIds: z.array(z.string()).default([]),
+  dependencyIssueIds: z.array(z.string()).default([]),
+  dependencyTitles: z.array(z.string()).default([]),
+  // Files/modules this task will touch (declared by the planner). Drives
+  // file-scope overlap detection so non-overlapping tasks run concurrently.
+  fileScope: z.array(z.string()).default([]),
+  topoRank: z.number().int().nonnegative().optional(),
+  linearState: z.string().optional(),
+  execution: ExecutionStateSchema.default({ status: 'backlog', retryCount: 0 }),
+  worktree: WorktreeStateSchema.default({}),
+  updatedAt: z.string(),
+  /** Last time reconcileDependencyBlockers looked this id up. Distinct from
+   *  updatedAt so a worker touching the blocker does not look like a lookup. */
+  dependencyCheckedAt: z.string().optional(),
+  dependencyLookupFailed: z.boolean().optional(),
+});
+
+function createTaskMap(
+  entries: Iterable<[string, z.infer<typeof OpenSwarmTaskStateSchema>]> = [],
+): Record<string, z.infer<typeof OpenSwarmTaskStateSchema>> {
+  const tasks: Record<string, z.infer<typeof OpenSwarmTaskStateSchema>> = Object.create(null);
+  for (const [issueId, state] of entries) {
+    tasks[issueId] = state;
+  }
+  return tasks;
+}
+
+const TaskStateStoreSchema = z.object({
+  version: z.literal(1).default(1),
+  tasks: z.preprocess(
+    (value) => {
+      if (value === undefined) return [];
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        return Object.entries(value as Record<string, unknown>);
+      }
+      return value;
+    },
+    z.array(z.tuple([z.string(), OpenSwarmTaskStateSchema]))
+      .transform((entries) => createTaskMap(entries))
+  ).default(() => createTaskMap()),
+  updatedAt: z.string(),
+});
+
+export type TaskExecutionStatus = z.infer<typeof TaskExecutionStatusSchema>;
+export type OpenSwarmTaskState = z.infer<typeof OpenSwarmTaskStateSchema>;
+type TaskStateStore = z.infer<typeof TaskStateStoreSchema>;
+
+let cache: TaskStateStore | null = null;
+let cacheStamp: string | null = null;
+const LOCK_STALE_MS = 30_000;
+const LOCK_ABANDON_MS = 600_000;
+const LOCK_WAIT_MS = 10;
+const LOCK_TIMEOUT_MS = 5_000;
+const lockWaitBuffer = new Int32Array(new SharedArrayBuffer(4));
+
+/** `ns`: the writer's pid space. A string identifies it; `null` records that
+ * the writer could not determine its own (a Linux process with an unreadable
+ * /proc/self/ns/pid); absent means the lock predates the field entirely. The
+ * three are distinct — collapsing "unknown" into "absent" would let a
+ * fail-closed writer be probed as if it had opted into the legacy rule. */
+type StoreLockOwner = { pid: number; token: string; ns?: string | null; instance?: string };
+
+/** Preserves the string / null / absent distinction described on StoreLockOwner. */
+function lockNamespaceOf(raw: unknown): string | null | undefined {
+  if (raw === null) return null;
+  return typeof raw === 'string' ? raw : undefined;
+}
+
+/**
+ * What a held lock records about its holder. Exported because the writer is the
+ * only place these fields originate and `withStoreLock` removes the file in its
+ * `finally`, so there is no way to observe the real thing after the fact — a
+ * mutation dropping `instance` passed the whole suite until this existed.
+ *
+ * `instance` is what lets a successor decide ownership without a clock;
+ * `ns` scopes the pid; `?? null` on the namespace is deliberate — an omitted
+ * key would be indistinguishable from a lock written before the field existed.
+ */
+export function buildLockPayload(token: string): StoreLockOwner {
+  return { pid: process.pid, token, ns: processNamespaceId() ?? null, instance: getInstanceId() };
+}
+
+/** Whether this lock's pid can be probed from here at all. */
+function lockPidIsJudgeable(owner: StoreLockOwner): boolean {
+  // Absent keeps the original probe; null fails closed (the writer could name
+  // no space, so our pid table is not its pid table); a string must be ours.
+  // See the matching note in worktreeManager, including its AGT-4069 caveat.
+  if (owner.ns === undefined) return true;
+  if (owner.ns === null) return false;
+  return sameProcessNamespace(owner.ns);
+}
+
+function readStoreLockOwner(lockPath: string): StoreLockOwner | null {
+  try {
+    const value = JSON.parse(readFileSync(lockPath, 'utf8')) as Partial<StoreLockOwner>;
+    return Number.isInteger(value.pid) && (value.pid ?? 0) > 0 && typeof value.token === 'string'
+      ? {
+        pid: value.pid!,
+        token: value.token,
+        ns: lockNamespaceOf(value.ns),
+        instance: typeof value.instance === 'string' ? value.instance : undefined,
+      }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Cache identity for the on-disk store. Includes inode so a same-size
+ *  cross-process replacement (atomic rename) within one mtime tick still
+ *  invalidates — mtime+size alone can miss that case. */
+function storeFileStamp(path: string): string {
+  const stat = statSync(path);
+  return `${stat.mtimeMs}:${stat.size}:${stat.ino}`;
+}
+
+function getStorePath(): string {
+  return process.env.OPENSWARM_TASK_STATE_FILE || join(homedir(), '.openswarm', 'task-state.json');
+}
+
+function ensureStoreLoaded(): TaskStateStore {
+  const path = getStorePath();
+  const currentStamp = existsSync(path) ? storeFileStamp(path) : 'missing';
+  if (cache && cacheStamp === currentStamp) return cache;
+
+  if (existsSync(path)) {
+    let data: unknown;
+    try {
+      data = JSON.parse(readFileSync(path, 'utf8'));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Task state store is corrupt at ${path}: ${message}`);
+    }
+
+    const parsed = TaskStateStoreSchema.safeParse(data);
+    if (!parsed.success) {
+      throw new Error(`Task state store is invalid at ${path}: ${parsed.error.message}`);
+    }
+
+    cache = parsed.data;
+    cacheStamp = currentStamp;
+    return cache;
+  }
+
+  cache = {
+    version: 1,
+    tasks: createTaskMap(),
+    updatedAt: new Date().toISOString(),
+  };
+  cacheStamp = currentStamp;
+  return cache;
+}
+
+export function resetTaskStateStoreForTests(): void {
+  cache = null;
+  cacheStamp = null;
+}
+
+function withStoreLock<T>(operation: () => T): T {
+  const path = getStorePath();
+  const directory = dirname(path);
+  const lockPath = `${path}.lock`;
+  mkdirSync(directory, { recursive: true });
+  // Transition mutex: SQLite first, then the legacy dot-lock for old CLI releases.
+  const mutexDb = new Database(`${path}.mutex.db`, { timeout: LOCK_TIMEOUT_MS }); mutexDb.exec('PRAGMA journal_mode = DELETE; CREATE TABLE IF NOT EXISTS task_state_mutex (id INTEGER PRIMARY KEY CHECK (id = 1)); INSERT OR IGNORE INTO task_state_mutex (id) VALUES (1); BEGIN IMMEDIATE');
+  const deadline = Date.now() + LOCK_TIMEOUT_MS; let lockFd: number | undefined; const lockToken = randomUUID();
+
+  try {
+    while (lockFd === undefined) {
+      try {
+        lockFd = openSync(lockPath, 'wx', 0o600);
+        // `?? null` deliberately: an omitted key would be indistinguishable from
+        // a pre-field lock, which readers are entitled to probe locally.
+        writeFileSync(lockFd, JSON.stringify(buildLockPayload(lockToken)), 'utf8');
+        fsyncSync(lockFd);
+      } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'EEXIST') throw error;
+      try {
+        const owner = readStoreLockOwner(lockPath);
+        const judgedMtimeMs = statSync(lockPath).mtimeMs;
+        const lockAgeMs = Date.now() - judgedMtimeMs;
+        const staleMalformedLock = !owner && lockAgeMs > LOCK_STALE_MS;
+        // A pid only means something inside the space it was issued in. This
+        // file can be a projection two containers share, so probing a lock
+        // that names a different space answers about whatever holds that
+        // number locally — and an ESRCH there would reclaim a lock a live
+        // writer still holds. Such a lock gets the age rule and nothing else.
+        // A lock with no space recorded predates the field and keeps the
+        // original probe behaviour. (Caught by the commit-gate review.)
+        const ownerPidIsJudgeable = owner !== null && lockPidIsJudgeable(owner);
+        const abandonedLock = owner !== null && ownerPidIsJudgeable && !processAppearsAlive(owner.pid);
+        // The pid probe above cannot see a generation change, so a lock the
+        // previous container left behind reads as held against the new daemon
+        // that inherited its pid. Settling that case outright, instead of
+        // waiting out LOCK_ABANDON_MS, is worth a full ten minutes of dead
+        // heartbeats after every restart. (AGT-4068)
+        //
+        // Gated on the recorded pid namespace, because that is the scope in
+        // which a pid is unique — and this file may be a mounted projection
+        // two containers share, each with its own pid 1. A lock from a
+        // different namespace, or one written before this field existed, is
+        // NOT reasoned about by pid: it falls through to the age rule below,
+        // which is exactly what the AGT-4023 policy test pins.
+        const priorGenerationLock = owner !== null
+          && isProofCapableSpace(owner.ns ?? undefined) && sameProcessNamespace(owner.ns ?? undefined)
+          && writerProvablyGone({
+            pid: owner.pid,
+            ownerId: owner.instance,
+            ourOwnerId: getInstanceId(),
+            writtenAtMs: judgedMtimeMs,
+          });
+        // A pid probe cannot see past its own namespace, and a container
+        // assigns the daemon the same pid every start — so a lock left behind
+        // by a killed container reads as "alive" against the new daemon
+        // itself, and nothing ever frees it (AGT-4023: 15 straight heartbeats
+        // dead, zero tasks for 75 minutes, manual rm the only exit). Age is
+        // the one signal that stays true across namespaces and generations.
+        //
+        // What this buys and what it costs. The guarded work is synchronous —
+        // read, parse, write, fsync, rename, measured at tens of milliseconds
+        // — and an out-of-space write fails fast rather than blocking, so
+        // reaching this threshold takes a frozen process (SIGSTOP, docker
+        // pause, uninterruptible I/O) or a wall-clock jump, since mtime is
+        // compared against a non-monotonic clock. A process frozen that long
+        // is serving nothing anyway. If one is evicted and later resumes, it
+        // overwrites with its own snapshot: a lost update, never a torn file
+        // (persistStore renames atomically) and never a cascade (the exit
+        // unlink is token-guarded). The run ledger — not this projection —
+        // owns leases and remote effects, so a rollback here cannot
+        // double-execute anything, and the next Linear sync re-derives it.
+        const expiredLock = lockAgeMs > LOCK_ABANDON_MS;
+        if (staleMalformedLock || abandonedLock || priorGenerationLock || expiredLock) {
+          // Reclaim only the lock that was actually judged. Between the
+          // judgement above and this unlink the holder can release and a third
+          // process can take a fresh lock; deleting THAT one would put two
+          // writers in the store. Re-reading identity here narrows the window
+          // to a pair of syscalls — it does not close it, because POSIX has no
+          // compare-and-unlink for a regular file. Closing it needs a
+          // kernel-owned mutex (AGT-4024).
+          const currentMtimeMs = statSync(lockPath).mtimeMs;
+          const currentOwner = readStoreLockOwner(lockPath);
+          const sameLock = currentMtimeMs === judgedMtimeMs
+            && currentOwner?.token === owner?.token;
+          if (sameLock) {
+            try {
+              unlinkSync(lockPath);
+            } catch (unlinkError) {
+              const code = (unlinkError as NodeJS.ErrnoException).code;
+              // Another reclaim raced (ENOENT) or claim markers make a dir lock
+              // non-empty (ENOTEMPTY) — retry the acquire loop instead of
+              // failing the whole store write.
+              if (code !== 'ENOENT' && code !== 'ENOTEMPTY') throw unlinkError;
+            }
+          }
+          continue;
+        }
+      } catch (statError) {
+        if ((statError as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw statError;
+      }
+        if (Date.now() >= deadline) throw new Error(`Timed out waiting for task state lock: ${lockPath}`);
+        Atomics.wait(lockWaitBuffer, 0, 0, LOCK_WAIT_MS);
+      }
+    }
+
+    // Another process may have committed since this process populated cache.
+    cache = null;
+    return operation();
+  } finally {
+    if (lockFd !== undefined) closeSync(lockFd);
+    try {
+      // Only the process/token that created the current path may unlink it. If
+      // an operator or recovery path replaced the lock, leave the replacement.
+      if (readStoreLockOwner(lockPath)?.token === lockToken) unlinkSync(lockPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        console.warn(`[TaskState] Failed to remove lock ${lockPath}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    try { mutexDb.exec('ROLLBACK'); } finally { mutexDb.close(); }
+  }
+}
+
+function persistStore(): void {
+  const store = ensureStoreLoaded();
+  store.updatedAt = new Date().toISOString();
+  const path = getStorePath();
+  const directory = dirname(path);
+  mkdirSync(directory, { recursive: true });
+
+  // Write + fsync + atomic rename. A daemon kill or ENOSPC must leave either
+  // the old complete snapshot or the new complete snapshot, never truncated
+  // JSON that prevents the next startup. The SQLite run ledger is execution
+  // truth; this file remains a compatibility projection.
+  const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  let fd: number | undefined;
+  try {
+    fd = openSync(temporaryPath, 'wx', 0o600);
+    writeFileSync(fd, JSON.stringify(store, null, 2), 'utf8');
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(temporaryPath, path);
+    chmodSync(path, 0o600);
+    const persistedStat = statSync(path);
+    cacheStamp = `${persistedStat.mtimeMs}:${persistedStat.size}:${persistedStat.ino}`;
+
+    // Persist the directory entry where the platform supports directory fsync.
+    let directoryFd: number | undefined;
+    try {
+      directoryFd = openSync(directory, 'r');
+      fsyncSync(directoryFd);
+    } catch {
+      // Windows and some filesystems reject directory fsync; the file itself is
+      // already durable and atomically visible.
+    } finally {
+      if (directoryFd !== undefined) closeSync(directoryFd);
+    }
+  } catch (error) {
+    if (fd !== undefined) closeSync(fd);
+    try {
+      if (existsSync(temporaryPath)) unlinkSync(temporaryPath);
+    } catch {
+      // Keep the original persistence error; cleanup failure is secondary.
+    }
+    throw error;
+  }
+}
+
+function createDefaultState(issueId: string): OpenSwarmTaskState {
+  return {
+    version: 1,
+    issueId,
+    childIssueIds: [],
+    dependencyIssueIds: [],
+    dependencyTitles: [],
+    fileScope: [],
+    execution: {
+      status: 'backlog',
+      retryCount: 0,
+    },
+    worktree: {},
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+export function getTaskState(issueId: string): OpenSwarmTaskState | undefined {
+  return ensureStoreLoaded().tasks[issueId];
+}
+
+export function listTaskStates(): OpenSwarmTaskState[] {
+  return Object.values(ensureStoreLoaded().tasks);
+}
+
+/**
+ * Merge a patch into one task row. Pure: `updatedAt` is the caller's, so the
+ * same merge can be run once to ask "would this change anything" (with the
+ * row's own timestamp) and again to apply it.
+ */
+function mergeTaskState(
+  current: OpenSwarmTaskState | undefined,
+  issueId: string,
+  patch: Partial<OpenSwarmTaskState>,
+  updatedAt: string,
+): OpenSwarmTaskState {
+  const base = current || createDefaultState(issueId);
+  const { execution, worktree, ...topLevelPatch } = patch;
+  const definedTopLevelPatch = Object.fromEntries(
+    Object.entries(topLevelPatch).filter(([, value]) => value !== undefined)
+  ) as Partial<OpenSwarmTaskState>;
+  const merged: OpenSwarmTaskState = {
+    ...base,
+    ...definedTopLevelPatch,
+    issueId,
+    childIssueIds: patch.childIssueIds ?? base.childIssueIds ?? [],
+    dependencyIssueIds: patch.dependencyIssueIds ?? base.dependencyIssueIds ?? [],
+    dependencyTitles: patch.dependencyTitles ?? base.dependencyTitles ?? [],
+    fileScope: patch.fileScope ?? base.fileScope ?? [],
+    execution: { ...base.execution, ...execution },
+    worktree: { ...base.worktree, ...worktree },
+    updatedAt,
+  };
+  return OpenSwarmTaskStateSchema.parse(merged);
+}
+
+/** Mutate the in-memory store. Caller MUST hold `withStoreLock`. */
+function upsertTaskStateUnlocked(issueId: string, patch: Partial<OpenSwarmTaskState>): OpenSwarmTaskState {
+  const store = ensureStoreLoaded();
+  store.tasks[issueId] = mergeTaskState(store.tasks[issueId], issueId, patch, new Date().toISOString());
+  persistStore();
+  return store.tasks[issueId];
+}
+
+/** Two rows hold the same data. Both sides are schema-parsed, so key order is the schema's. */
+function sameTaskStateRow(a: OpenSwarmTaskState, b: OpenSwarmTaskState): boolean {
+  return JSON.stringify({ ...a, updatedAt: '' }) === JSON.stringify({ ...b, updatedAt: '' });
+}
+
+/**
+ * Merge a patch into the in-memory store WITHOUT persisting, and say whether it
+ * changed anything. A patch that leaves the row as it was writes nothing — not
+ * even a fresh `updatedAt`, which is what made every no-op look like a change.
+ * Caller MUST hold `withStoreLock` and persist when this returned true.
+ */
+function applyTaskStatePatchIfChanged(
+  store: TaskStateStore,
+  issueId: string,
+  patch: Partial<OpenSwarmTaskState>,
+): boolean {
+  const current = store.tasks[issueId];
+  if (current && sameTaskStateRow(mergeTaskState(current, issueId, patch, current.updatedAt), current)) return false;
+  store.tasks[issueId] = mergeTaskState(current, issueId, patch, new Date().toISOString());
+  return true;
+}
+
+export function upsertTaskState(issueId: string, patch: Partial<OpenSwarmTaskState>): OpenSwarmTaskState {
+  return withStoreLock(() => upsertTaskStateUnlocked(issueId, patch));
+}
+
+export function enrichTaskFromState(task: TaskItem): TaskItem {
+  const issueId = task.issueId || task.id;
+  const state = getTaskState(issueId);
+  if (!state) return task;
+
+  const stateScope = (!task.fileScope || task.fileScope.length === 0) && state.fileScope.length > 0;
+  return {
+    ...task,
+    parentId: task.parentId || state.parentIssueId,
+    blockedBy: task.blockedBy && task.blockedBy.length > 0 ? task.blockedBy : state.dependencyIssueIds,
+    topoRank: task.topoRank ?? state.topoRank,
+    linearState: task.linearState || state.linearState,
+    fileScope: task.fileScope && task.fileScope.length > 0 ? task.fileScope : state.fileScope,
+    fileScopeSource: task.fileScopeSource ?? (stateScope ? 'declared' : undefined),
+  };
+}
+
+/**
+ * The execution status a Linear state implies, for the R5 reconciliation below.
+ * Any state absent from this map leaves the local status alone.
+ */
+const LINEAR_STATE_TO_EXECUTION_STATUS: Record<string, TaskExecutionStatus> = {
+  Done: 'done',
+  'In Progress': 'in_progress',
+  Todo: 'todo',
+  Backlog: 'backlog',
+  Canceled: 'backlog',
+  Cancelled: 'backlog',
+};
+
+/**
+ * The execution status this reconciliation would move the task to, or
+ * `undefined` when it would leave the status where it is.
+ *
+ * Only a locally `in_progress` or `done` task is downgraded: those are the two
+ * statuses that wrongly satisfy a dependency or wrongly look live if Linear has
+ * since moved the issue elsewhere.
+ */
+function reconciledExecutionStatus(
+  current: OpenSwarmTaskState | undefined,
+  linearState: string,
+): TaskExecutionStatus | undefined {
+  const status = current?.execution.status;
+  if (status !== 'in_progress' && status !== 'done') return undefined;
+  const next = LINEAR_STATE_TO_EXECUTION_STATUS[linearState];
+  return next === undefined || next === status ? undefined : next;
+}
+
+/**
+ * Decide what a Linear-state reconciliation would change, or `null` when it
+ * would change nothing.
+ *
+ * Split out from the write so the decision is testable on its own, and so the
+ * common answer — "nothing" — costs nothing. The heartbeat calls this once per
+ * fetched issue, and almost none have moved since the previous poll. A no-op is
+ * not cheap here: the store is one file holding every task, so a single
+ * unchanged row still costs a full parse, re-serialize, write and two fsyncs of
+ * the whole store. At 3146 tasks that measured 18 ms each, which is how a quiet
+ * heartbeat came to block the event loop for ~30 s and write 1.4 GiB (AGT-4086).
+ */
+export function planLinearStateReconciliation(
+  current: OpenSwarmTaskState | undefined,
+  linearState: string,
+): Partial<OpenSwarmTaskState> | null {
+  const nextStatus = reconciledExecutionStatus(current, linearState);
+  if (current && current.linearState === linearState && nextStatus === undefined) return null;
+
+  const patch: Partial<OpenSwarmTaskState> = { linearState };
+  if (current && nextStatus !== undefined) {
+    patch.execution = { ...current.execution, status: nextStatus };
+  }
+  return patch;
+}
+
+export function updateTaskLinearState(issueId: string, linearState: string): OpenSwarmTaskState {
+  // R5: reconcile stale local execution status against Linear (the source of
+  // truth). If Linear parks, reopens, or completes an issue while local state is
+  // stale, downgrade it so dependencies do not stay incorrectly resolved or
+  // actively running. This is a local-only update; it never writes back to
+  // Linear (preserves R7).
+  //
+  // Patch planning MUST happen under the write lock: a concurrent upsert can
+  // change execution status between an unlocked read and the write, and the
+  // reconciliation would then commit a stale downgrade (or miss one).
+  return withStoreLock(() => {
+    const current = ensureStoreLoaded().tasks[issueId];
+    const patch = planLinearStateReconciliation(current, linearState);
+    if (patch === null && current) return current;
+    return upsertTaskStateUnlocked(issueId, patch ?? { linearState });
+  });
+}
+
+export function markTaskInProgress(
+  issueId: string,
+  patch: {
+    issueIdentifier?: string;
+    title?: string;
+    projectId?: string;
+    projectName?: string;
+    linearState?: string;
+    sessionId?: string;
+    branchName?: string;
+    worktreePath?: string;
+  } = {},
+): OpenSwarmTaskState {
+  return upsertTaskState(issueId, {
+    issueIdentifier: patch.issueIdentifier,
+    title: patch.title,
+    projectId: patch.projectId,
+    projectName: patch.projectName,
+    linearState: patch.linearState ?? 'In Progress',
+    execution: {
+      status: 'in_progress',
+      blockedReason: undefined,
+      retryCount: 0,
+      lastSessionId: patch.sessionId,
+    },
+    worktree: {
+      branchName: patch.branchName,
+      worktreePath: patch.worktreePath,
+    },
+  });
+}
+
+/**
+ * Claim a task for execution in one locked read-modify-write, or return null
+ * when another actor already holds it.
+ *
+ * `markTaskInProgress` alone is not an admission check: two runners (or two
+ * daemon instances sharing one state file) both read `backlog`, both write
+ * `in_progress`, and the same issue is executed twice. Deciding and writing
+ * under one store lock is what makes the claim exclusive.
+ */
+export function tryClaimTaskAdmission(
+  issueId: string,
+  patch: Parameters<typeof markTaskInProgress>[1] = {},
+  options: {
+    /**
+     * The caller has established that the existing `in_progress` marker has no
+     * live executor behind it (a restart or an expired lease left it), so the
+     * claim may take it over instead of reporting "claimed by another
+     * instance". Without this a stale marker blocked admission even after the
+     * decision engine stopped filtering on it (AGT-4667).
+     */
+    takeOverStale?: boolean;
+  } = {},
+): OpenSwarmTaskState | null {
+  return withStoreLock(() => {
+    const store = ensureStoreLoaded();
+    if (store.tasks[issueId]?.execution.status === 'in_progress' && !options.takeOverStale) return null;
+    const result = upsertTaskStateUnlocked(issueId, {
+      issueIdentifier: patch.issueIdentifier,
+      title: patch.title,
+      projectId: patch.projectId,
+      projectName: patch.projectName,
+      linearState: patch.linearState ?? 'In Progress',
+      execution: {
+        status: 'in_progress',
+        blockedReason: undefined,
+        retryCount: 0,
+        lastSessionId: patch.sessionId,
+      },
+      worktree: {
+        branchName: patch.branchName,
+        worktreePath: patch.worktreePath,
+      },
+    });
+    return result;
+  });
+}
+
+export function markTaskBacklog(
+  issueId: string,
+  patch: {
+    issueIdentifier?: string;
+    title?: string;
+    linearState?: string;
+  } = {},
+): OpenSwarmTaskState {
+  return upsertTaskState(issueId, {
+    issueIdentifier: patch.issueIdentifier,
+    title: patch.title,
+    linearState: patch.linearState ?? 'Backlog',
+    execution: {
+      status: 'backlog',
+      blockedReason: undefined,
+      retryCount: 0,
+    },
+    worktree: {
+      branchName: undefined,
+      worktreePath: undefined,
+    },
+  });
+}
+
+export function markTaskDone(
+  issueId: string,
+  patch: {
+    issueIdentifier?: string;
+    title?: string;
+    confidence?: number;
+    linearState?: string;
+  } = {},
+): OpenSwarmTaskState {
+  return upsertTaskState(issueId, {
+    issueIdentifier: patch.issueIdentifier,
+    title: patch.title,
+    linearState: patch.linearState ?? 'Done',
+    execution: {
+      status: 'done',
+      blockedReason: undefined,
+      retryCount: 0,
+      confidence: patch.confidence,
+    },
+  });
+}
+
+export function markTaskBlocked(
+  issueId: string,
+  reason: string,
+  dependencyIssueIds: string[] = [],
+  linearState?: string,
+): OpenSwarmTaskState {
+  return upsertTaskState(issueId, {
+    dependencyIssueIds,
+    linearState,
+    execution: {
+      status: 'blocked',
+      blockedReason: reason,
+      retryCount: 0,
+    },
+  });
+}
+
+export function markTaskFailed(issueId: string, reason: string, linearState?: string): OpenSwarmTaskState {
+  return upsertTaskState(issueId, {
+    linearState,
+    execution: {
+      status: 'failed',
+      blockedReason: reason,
+      retryCount: 0,
+    },
+  });
+}
+
+export function markTaskDecomposed(
+  issueId: string,
+  patch: {
+    issueIdentifier?: string;
+    title?: string;
+    projectId?: string;
+    projectName?: string;
+    parentIssueId?: string;
+    childIssueIds: string[];
+  },
+): OpenSwarmTaskState {
+  return upsertTaskState(issueId, {
+    issueIdentifier: patch.issueIdentifier,
+    title: patch.title,
+    projectId: patch.projectId,
+    projectName: patch.projectName,
+    parentIssueId: patch.parentIssueId,
+    childIssueIds: patch.childIssueIds,
+    execution: {
+      status: 'decomposed',
+      blockedReason: undefined,
+      retryCount: 0,
+    },
+    linearState: 'In Progress',
+  });
+}
+
+function isResolved(state: OpenSwarmTaskState | undefined): boolean {
+  if (!state) return false;
+  return state.execution.status === 'done' || state.linearState === 'Done';
+}
+
+function isDependencyTerminalLinearState(linearState: string | undefined): boolean {
+  const name = linearState?.trim().toLowerCase();
+  return name === 'canceled' || name === 'cancelled' || name === 'duplicate';
+}
+
+/** A blocker that can no longer move work forward. Done is the historical
+ *  isResolved contract (parent-completion still uses that). Canceled/Duplicate
+ *  are terminal for dependencies — vela 2026-09-09: Canceled STO-* ids occupied
+ *  maxLookups, and AGT-4115 (Duplicate on Linear, In Progress locally) kept
+ *  AGT-4121 blocked after AGT-4253. Matches trackerTerminalReconciler. */
+function isDependencyTerminal(state: OpenSwarmTaskState | undefined): boolean {
+  if (isResolved(state)) return true;
+  return isDependencyTerminalLinearState(state?.linearState);
+}
+
+export function getTaskReadiness(task: TaskItem): {
+  ready: boolean;
+  blockedBy: string[];
+  reason?: string;
+} {
+  const issueId = task.issueId || task.id;
+  const state = getTaskState(issueId);
+  const dependencyIssueIds = task.blockedBy && task.blockedBy.length > 0
+    ? task.blockedBy
+    : state?.dependencyIssueIds || [];
+
+  if (state?.execution.status === 'decomposed') {
+    // If Linear state was manually changed back to actionable, allow re-execution.
+    // `In Review` is treated as actionable too — reviewer feedback on a
+    // decomposed task should get picked up rather than ignored.
+    const linearState = task.linearState || state.linearState;
+    const reactivated =
+      linearState === 'Todo' ||
+      linearState === 'In Progress' ||
+      linearState === 'In Review' ||
+      linearState === 'Backlog';
+    if (!reactivated) {
+      return {
+        ready: false,
+        blockedBy: [],
+        reason: 'Task already decomposed into child issues',
+      };
+    }
+    // Decomposed but Linear state is actionable — allow execution
+    console.log(`[TaskState] ${task.issueIdentifier}: decomposed but Linear state is "${linearState}", allowing re-execution`);
+  }
+
+  if (dependencyIssueIds.length === 0) {
+    return { ready: true, blockedBy: [] };
+  }
+
+  const unresolved = dependencyIssueIds.filter((depId) => !isDependencyTerminal(getTaskState(depId)));
+  if (unresolved.length > 0) {
+    return {
+      ready: false,
+      blockedBy: unresolved,
+      reason: `Waiting on dependencies: ${unresolved.join(', ')}`,
+    };
+  }
+
+  return { ready: true, blockedBy: [] };
+}
+
+export function releaseDependentTasks(completedIssueId: string): OpenSwarmTaskState[] {
+  const store = ensureStoreLoaded();
+  const released: OpenSwarmTaskState[] = [];
+
+  for (const state of Object.values(store.tasks)) {
+    if (!state.dependencyIssueIds.includes(completedIssueId)) continue;
+
+    const unresolved = state.dependencyIssueIds.filter((depId) => !isDependencyTerminal(store.tasks[depId]));
+    if (unresolved.length > 0) {
+      upsertTaskState(state.issueId, {
+        execution: {
+          status: 'blocked',
+          blockedReason: `Waiting on dependencies: ${unresolved.join(', ')}`,
+          retryCount: state.execution.retryCount,
+        },
+      });
+      continue;
+    }
+
+    const next = upsertTaskState(state.issueId, {
+      execution: {
+        status: 'todo',
+        blockedReason: undefined,
+        retryCount: state.execution.retryCount,
+      },
+      linearState: 'Todo',
+    });
+    released.push(next);
+  }
+
+  return released;
+}
+
+/** Structural subset of ITaskSource — avoids importing automation/taskSource.js, which
+ *  already imports enrichTaskFromState from this module. */
+interface DependencyLookupSource {
+  lookupIssueState(issueIdOrIdentifier: string): Promise<
+    | { ok: true; issue: { state: string; stateType?: string } | null }
+    | { ok: false; error: string }
+  >;
+}
+
+export interface DependencyBlockerReconcileOptions {
+  source: DependencyLookupSource | null;
+  /** Issue ids present in the current heartbeat's fresh fetch. A dependency id found
+   *  here is still Todo/In Progress/In Review/Backlog — genuinely open, skip the lookup. */
+  knownTaskIds?: ReadonlySet<string>;
+  now?: number;
+  /** Only reconsider a dependent task that has sat blocked at least this long —
+   *  a decomposition just created seconds ago is not yet stale. */
+  staleAfterMs?: number;
+  maxLookups?: number;
+  /** Skip a blocker looked up this recently — same role as
+   *  reconcileTrackerTerminalRuns' recheckAfterMs. Default 6h. */
+  recheckAfterMs?: number;
+  /** Failed lookups retry sooner than a confirmed-open skip. Default 15m. */
+  errorRecheckAfterMs?: number;
+  /** Dependency ids blocking tasks in this heartbeat's Linear fetch.
+   *  Looked up before the rest of the store so a live queue cannot starve
+   *  behind July KT-* Backlog from projects this daemon does not run. */
+  priorityDepIds?: ReadonlySet<string>;
+}
+
+export interface DependencyBlockerReconcileResult {
+  /** Distinct unresolved dependency ids that were candidates this pass. */
+  eligible: number;
+  lookedUp: number;
+  /** Dependencies confirmed terminal (Done/Cancelled) by a live lookup. */
+  resolved: number;
+  /** Dependent tasks released as a result. */
+  released: number;
+}
+
+/**
+ * Reconcile dependency ids that a Done Linear issue leaves behind.
+ *
+ * `releaseDependentTasks` only fires when the daemon's own pipeline observes a
+ * completion (runnerExecution.ts). A blocker finished through any other path —
+ * merged by a human, completed in a different session — never triggers it, and
+ * getTaskReadiness's fallback to the locally cached `dependencyIssueIds` (used
+ * whenever the fresh Linear fetch's `blockedBy` comes back empty, which it always
+ * does once the blocker is Done and drops out of the slim fetch) then blocks the
+ * dependent forever. Terminal issues are invisible to the regular slim fetch
+ * (Todo/In Progress/In Review/Backlog only), so this is the explicit per-issue
+ * read that can see them — same shape as reconcileTrackerTerminalRuns, applied to
+ * taskState instead of the durable ledger.
+ *
+ * Canceled/Cancelled blockers are terminal for dependents (isDependencyTerminal)
+ * even though isResolved stays Done-only for completeParentIfChildrenDone.
+ * Live vela 2026-09-09: 20 locally-Canceled STO-* ids occupied maxLookups
+ * every heartbeat, so AGT-4207 (157th, Linear already Done) was never reached.
+ *
+ * Lookups are capped. Candidates due for a check are sorted heartbeat-priority
+ * first (deps of tasks in this fetch), then never-checked, then oldest-checked.
+ * A lookup — success or fail-closed — stamps dependencyCheckedAt so the same
+ * 20 cannot consume the cap on the next heartbeat.
+ *
+ * Only tasks still in a not-yet-executed phase (todo/ready/blocked) are
+ * considered. dependencyIssueIds is never cleared once a task moves on (done,
+ * in_progress, decomposed, ...) — without this filter, an unrelated stale
+ * dependency entry left on an already-finished task would get resolved by this
+ * sweep and incorrectly reset that task's status back to 'todo' via
+ * releaseDependentTasks. A dependent isn't necessarily marked 'blocked' up
+ * front — getTaskReadiness gates on dependencyIssueIds at read time regardless
+ * of the stored execution.status, and only releaseDependentTasks itself writes
+ * 'blocked' when it finds a dependency still outstanding — so 'todo'/'ready'
+ * both need to stay in scope, not just 'blocked'.
+ */
+const DEPENDENCY_RECONCILE_ELIGIBLE_STATUSES = new Set<TaskExecutionStatus>(['todo', 'ready', 'blocked']);
+
+function blockerCheckedAtMs(state: OpenSwarmTaskState | undefined): number {
+  if (!state?.dependencyCheckedAt) return 0;
+  const ms = Date.parse(state.dependencyCheckedAt);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function blockerUpdatedAtMs(state: OpenSwarmTaskState | undefined): number {
+  if (!state?.updatedAt) return 0;
+  const ms = Date.parse(state.updatedAt);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+export async function reconcileDependencyBlockers(
+  options: DependencyBlockerReconcileOptions,
+): Promise<DependencyBlockerReconcileResult> {
+  const result: DependencyBlockerReconcileResult = { eligible: 0, lookedUp: 0, resolved: 0, released: 0 };
+  const { source } = options;
+  if (!source) return result;
+
+  const now = options.now ?? Date.now();
+  const staleAfterMs = options.staleAfterMs ?? 60 * 60_000;
+  const recheckAfterMs = options.recheckAfterMs ?? 6 * 60 * 60_000;
+  const errorRecheckAfterMs = options.errorRecheckAfterMs ?? 15 * 60_000;
+  const maxLookups = Math.max(1, Math.floor(options.maxLookups ?? 20));
+  const knownTaskIds = options.knownTaskIds ?? new Set<string>();
+  const priorityDepIds = options.priorityDepIds ?? new Set<string>();
+
+  const byId = new Map<string, { depId: string; lastChecked: number; lastSeen: number; priority: number }>();
+  for (const state of listTaskStates()) {
+    if (!DEPENDENCY_RECONCILE_ELIGIBLE_STATUSES.has(state.execution.status)) continue;
+    if (state.dependencyIssueIds.length === 0) continue;
+    const updatedAtMs = Date.parse(state.updatedAt);
+    // Current-fetch dependents are upserted this heartbeat, so updatedAt is
+    // always fresh. Skipping them is why AGT-4121 stayed blocked after AGT-4254
+    // shipped: its six Linear-Done blockers were never eligible for lookup.
+    const fromCurrentFetch = knownTaskIds.has(state.issueId);
+    if (!fromCurrentFetch && Number.isFinite(updatedAtMs) && now - updatedAtMs < staleAfterMs) continue;
+    for (const depId of state.dependencyIssueIds) {
+      if (isDependencyTerminal(getTaskState(depId))) continue;
+      if (knownTaskIds.has(depId)) continue; // still open per this fetch — not stale
+      if (byId.has(depId)) continue;
+      const blocker = getTaskState(depId);
+      const lastChecked = blockerCheckedAtMs(blocker);
+      const skipFor = blocker?.dependencyLookupFailed ? errorRecheckAfterMs : recheckAfterMs;
+      if (lastChecked > 0 && now - lastChecked < skipFor) continue;
+      byId.set(depId, {
+        depId,
+        lastChecked,
+        lastSeen: blockerUpdatedAtMs(blocker),
+        priority: priorityDepIds.has(depId) ? 1 : 0,
+      });
+    }
+  }
+  const candidates = [...byId.values()].sort(
+    (a, b) => b.priority - a.priority || a.lastChecked - b.lastChecked || a.lastSeen - b.lastSeen || a.depId.localeCompare(b.depId),
+  );
+  result.eligible = candidates.length;
+
+  const checkedAt = new Date(now).toISOString();
+  for (const { depId } of candidates) {
+    if (result.lookedUp >= maxLookups) break;
+    let lookup: Awaited<ReturnType<DependencyLookupSource['lookupIssueState']>>;
+    try {
+      lookup = await source.lookupIssueState(depId);
+    } catch (error) {
+      lookup = { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+    result.lookedUp++;
+    if (lookup.ok && lookup.issue) {
+      updateTaskLinearState(depId, lookup.issue.state);
+      upsertTaskState(depId, { dependencyCheckedAt: checkedAt, dependencyLookupFailed: false });
+    } else {
+      // Stamp on fail-closed so a persistent lookup error cannot monopolize
+      // the cap. Retries after errorRecheckAfterMs (15m), not recheckAfterMs (6h).
+      upsertTaskState(depId, { dependencyCheckedAt: checkedAt, dependencyLookupFailed: true });
+    }
+    if (isDependencyTerminal(getTaskState(depId))) {
+      result.resolved++;
+      result.released += releaseDependentTasks(depId).length;
+    }
+  }
+
+  return result;
+}
+
+export function completeParentIfChildrenDone(childIssueId: string): OpenSwarmTaskState | null {
+  const childState = getTaskState(childIssueId);
+  if (!childState?.parentIssueId) return null;
+
+  const parentState = getTaskState(childState.parentIssueId);
+  if (!parentState || parentState.childIssueIds.length === 0) return null;
+
+  const allDone = parentState.childIssueIds.every((id) => isResolved(getTaskState(id)));
+  if (!allDone) return null;
+
+  return upsertTaskState(parentState.issueId, {
+    linearState: 'Done',
+    execution: {
+      status: 'done',
+      blockedReason: undefined,
+      retryCount: parentState.execution.retryCount,
+    },
+  });
+}
+
+export function buildTaskStateSyncComment(state: OpenSwarmTaskState, headline: string): string {
+  const deps = state.dependencyIssueIds.length > 0 ? state.dependencyIssueIds.join(', ') : '(none)';
+  const children = state.childIssueIds.length > 0 ? state.childIssueIds.join(', ') : '(none)';
+
+  return [
+    `🧭 **[OpenSwarm] ${headline}**`,
+    '',
+    `- Status: \`${state.execution.status}\``,
+    `- Linear state: \`${state.linearState || 'unknown'}\``,
+    `- Parent: \`${state.parentIssueId || 'none'}\``,
+    `- Dependencies: \`${deps}\``,
+    `- Children: \`${children}\``,
+    '',
+    TASK_STATE_MARKER,
+    '```json',
+    JSON.stringify(state, null, 2),
+    '```',
+  ].join('\n');
+}
+
+export function parseTaskStateSyncComment(body: string): OpenSwarmTaskState | null {
+  if (!body.includes(TASK_STATE_MARKER)) return null;
+  const match = body.match(/```json\s*([\s\S]*?)\s*```/);
+  if (!match) return null;
+
+  try {
+    return OpenSwarmTaskStateSchema.parse(JSON.parse(match[1]));
+  } catch {
+    return null;
+  }
+}
+
+export type TaskStateSyncComment = {
+  body: string;
+  createdAt?: string;
+  user?: string;
+  author?: string;
+  source?: string;
+};
+
+function trustedSyncCommentUsers(): Set<string> {
+  return new Set(
+    (process.env.OPENSWARM_TASK_STATE_TRUSTED_COMMENT_USERS || '')
+      .split(',')
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean)
+  );
+}
+
+function isTrustedTaskStateSyncComment(comment: TaskStateSyncComment): boolean {
+  if (!comment.body.includes(TASK_STATE_MARKER)) return false;
+  if (!comment.body.startsWith('🧭 **[OpenSwarm] ')) return false;
+
+  if (comment.source === 'openswarm') return true;
+
+  // Missing identity is not authority. A user can copy the marker/prefix into a
+  // comment, so authorless hydration must fail closed. Durable execution truth
+  // lives in automation.db; comments are audit/context only unless explicitly
+  // attributed to OpenSwarm or an allow-listed operator.
+  if (comment.user === undefined && comment.author === undefined && comment.source === undefined) return false;
+
+  const author = (comment.user || comment.author || '').trim().toLowerCase();
+  if (!author) return false;
+
+  if (trustedSyncCommentUsers().has(author)) return true;
+  return author.includes('openswarm') || author.includes('open swarm');
+}
+
+/** The newest trusted sync comment that describes this issue, parsed. */
+function latestTaskStateFromComments(
+  issueId: string,
+  comments: TaskStateSyncComment[],
+): OpenSwarmTaskState | undefined {
+  return [...comments]
+    .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''))
+    .filter(isTrustedTaskStateSyncComment)
+    .map((comment) => parseTaskStateSyncComment(comment.body))
+    .find((state): state is OpenSwarmTaskState => state !== null && state.issueId === issueId);
+}
+
+export function hydrateTaskStateFromComments(
+  issueId: string,
+  comments: TaskStateSyncComment[] = [],
+): OpenSwarmTaskState | undefined {
+  const latest = latestTaskStateFromComments(issueId, comments);
+  if (!latest) return undefined;
+
+  // Re-applying the comment that is already reflected must not rewrite the
+  // store: this runs for every issue that carries a sync comment on every
+  // heartbeat, and each rewrite is a parse + serialize + two fsyncs of the
+  // whole file (AGT-4659).
+  return withStoreLock(() => {
+    const store = ensureStoreLoaded();
+    if (applyTaskStatePatchIfChanged(store, issueId, latest)) persistStore();
+    return store.tasks[issueId];
+  });
+}
+
+/**
+ * Reconcile the whole heartbeat fetch against the store in one pass: take the
+ * store lock once, load it once, apply what changed, persist once.
+ *
+ * The heartbeat used to call `updateTaskLinearState` and
+ * `hydrateTaskStateFromComments` per issue. Each took the file lock (create,
+ * write, fsync, unlink), and the hydrate half rewrote the entire store for
+ * every issue that carried a sync comment — measured on the deployed daemon on
+ * 2026-10-03 as multi-second event-loop blocks every heartbeat, long enough to
+ * fail health checks and drop the dashboard. Per issue the semantics are the
+ * same as calling the two in that order; only the cost is different.
+ *
+ * Returns how many rows changed (0 means nothing was written).
+ */
+export function syncTaskStatesFromIssues(
+  issues: ReadonlyArray<{ issueId: string; linearState: string; comments?: TaskStateSyncComment[] }>,
+): number {
+  if (issues.length === 0) return 0;
+  return withStoreLock(() => {
+    const store = ensureStoreLoaded();
+    let changed = 0;
+    for (const issue of issues) {
+      // Patch planning reads the row under the same lock that writes it, for
+      // the reason `updateTaskLinearState` documents.
+      const patch = planLinearStateReconciliation(store.tasks[issue.issueId], issue.linearState);
+      if ((patch !== null || !store.tasks[issue.issueId])
+        && applyTaskStatePatchIfChanged(store, issue.issueId, patch ?? { linearState: issue.linearState })) {
+        changed += 1;
+      }
+      const latest = latestTaskStateFromComments(issue.issueId, issue.comments ?? []);
+      if (latest && applyTaskStatePatchIfChanged(store, issue.issueId, latest)) changed += 1;
+    }
+    if (changed > 0) persistStore();
+    return changed;
+  });
+}

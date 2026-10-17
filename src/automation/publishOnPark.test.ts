@@ -1,0 +1,597 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { ExecutionDurabilityHooks } from './durableRunCoordinator.js';
+
+const commitAndCreatePRWithHead = vi.hoisted(() => vi.fn());
+vi.mock('../support/worktreeManager.js', () => ({ commitAndCreatePRWithHead }));
+vi.mock('../core/eventHub.js', () => ({ broadcastEvent: vi.fn() }));
+
+import { PublicationScopeMismatchError } from '../support/publicationScopeFence.js';
+import { PUBLICATION_SCOPE_PARK_REASON, WORKER_NO_CHANGES_PARK_REASON, publishApprovedWork, publishFinishedRun, publishParkedIfNeeded, publishParkedWork, publishStuckWork, publishUnfinishedWork, shouldPublishParkedWork, shouldPublishUnfinishedWork, summarizeFailure } from './publishOnPark.js';
+
+beforeEach(() => {
+  commitAndCreatePRWithHead.mockReset();
+});
+
+describe('shouldPublishParkedWork (AGT-4076)', () => {
+  it('publishes when a run parks for the operator with a worktree', () => {
+    expect(shouldPublishParkedWork(true, { finalStatus: 'waiting_on_operator' })).toBe(true);
+  });
+
+  it('does not publish an approved run — the normal path already does', () => {
+    // Publishing here too would open a second PR for the same branch.
+    expect(shouldPublishParkedWork(true, { finalStatus: 'approved' })).toBe(false);
+  });
+
+  it('does not publish a failed run', () => {
+    expect(shouldPublishParkedWork(true, { finalStatus: 'failed' })).toBe(false);
+  });
+
+  it('does not publish a superseded run — admission was refused, so nothing ran', () => {
+    expect(shouldPublishParkedWork(true, { finalStatus: 'superseded' })).toBe(false);
+  });
+
+  it('does not publish twice when a PR already exists', () => {
+    expect(shouldPublishParkedWork(true, {
+      finalStatus: 'waiting_on_operator', prUrl: 'https://github.com/o/r/pull/1',
+    })).toBe(false);
+  });
+
+  it('does not publish without a worktree — there is nothing to publish from', () => {
+    expect(shouldPublishParkedWork(false, { finalStatus: 'waiting_on_operator' })).toBe(false);
+  });
+
+  it('does not publish a worktree whose sandbox command outcome is unknown', () => {
+    expect(shouldPublishParkedWork(true, {
+      finalStatus: 'waiting_on_operator',
+      workerResult: { executionOutcomeUnknown: true },
+    })).toBe(false);
+  });
+});
+
+describe('summarizeFailure (AGT-4672)', () => {
+  const dots = '.'.repeat(71);
+  const pytest = [
+    `[pytest:apps/pipelines] ${dots} [ 10%]`,
+    `${dots.slice(0, 40)}ss${dots.slice(0, 29)} [ 11%]`,
+    `${'s'.repeat(30)}${dots.slice(0, 41)} [ 12%]`,
+    '=================================== FAILURES ===================================',
+    '___________________________ test_month_column_width ____________________________',
+    'FAILED apps/pipelines/tests/test_b1_store_names.py::test_alias_rows - AssertionError: 4 != 8',
+    '1 failed, 412 passed, 31 skipped in 212.40s',
+  ].join('\n');
+
+  it('keeps the failing test and the totals of a long pytest run', () => {
+    const summary = summarizeFailure(pytest);
+    expect(summary).toContain('FAILED apps/pipelines/tests/test_b1_store_names.py::test_alias_rows');
+    expect(summary).toContain('1 failed, 412 passed');
+    expect(summary).not.toMatch(/\.{8,}/);
+    expect(summary.length).toBeLessThanOrEqual(500 + 5);
+  });
+
+  it('keeps the head and the tail of a long detail that has no progress rows', () => {
+    const detail = `worker: ${'a'.repeat(900)} end-marker`;
+    const summary = summarizeFailure(detail);
+    expect(summary.startsWith('worker: aaa')).toBe(true);
+    expect(summary.endsWith('end-marker')).toBe(true);
+    expect(summary).toContain(' … ');
+  });
+
+  it('leaves a short detail alone and names an empty one', () => {
+    expect(summarizeFailure('reviewer: tests missing   for the new branch')).toBe('reviewer: tests missing for the new branch');
+    expect(summarizeFailure(undefined)).toBe('no failure detail was recorded');
+    expect(summarizeFailure('   \n ')).toBe('no failure detail was recorded');
+  });
+});
+
+describe('publication identity (AGT-4145)', () => {
+  it('durably attaches the exact head returned by a successful reviewed publication', async () => {
+    commitAndCreatePRWithHead.mockResolvedValue({
+      prUrl: 'https://github.com/o/r/pull/17',
+      headSha: 'head-b',
+    });
+    const onPublication = vi.fn(async () => true);
+    const durability = {
+      beforePublish: vi.fn(async () => true),
+      onPublication,
+    } as unknown as ExecutionDurabilityHooks;
+    const result: { success: boolean; finalStatus: string; prUrl?: string } = {
+      success: true,
+      finalStatus: 'approved',
+    };
+
+    await publishApprovedWork(
+      { worktreePath: '/tmp/w', originalPath: '/tmp/r', branchName: 'swarm/AGT-4145', issueId: 'AGT-4145' },
+      { id: 'task-1', issueIdentifier: 'AGT-4145', title: 'Preserve publication identity' },
+      result,
+      durability,
+    );
+
+    expect(result.prUrl).toBe('https://github.com/o/r/pull/17');
+    expect(onPublication).toHaveBeenCalledWith('https://github.com/o/r/pull/17', 'head-b');
+  });
+});
+
+// vela 2026-09-02: AGT-3844 (48 attempts), AX-868 (23), AGT-4158 (15) — every
+// one a publication-scope rejection of files an EARLIER attempt had already
+// committed, turned into a 15-minute infra retry with a blank ledger message.
+describe('afterPublication hook (per-repository fresh review)', () => {
+  const info = { worktreePath: '/tmp/w', originalPath: '/tmp/r', branchName: 'swarm/AGT-1', issueId: 'AGT-1' };
+  const publishable = { id: 'task-1', issueIdentifier: 'AGT-1', title: 'Hooked' };
+
+  it('runs once, after the publication is durably recorded, with the PR identity', async () => {
+    commitAndCreatePRWithHead.mockResolvedValue({ prUrl: 'https://github.com/o/r/pull/9', headSha: 'head-9' });
+    const calls: string[] = [];
+    const durability = {
+      beforePublish: vi.fn(async () => true),
+      onPublication: vi.fn(async () => { calls.push('recorded'); return true; }),
+    } as unknown as ExecutionDurabilityHooks;
+    const hook = vi.fn(async (p: { prUrl: string; headSha: string }) => { calls.push(`hook:${p.prUrl}:${p.headSha}`); });
+    const result: { success: boolean; finalStatus: string; prUrl?: string } = { success: true, finalStatus: 'approved' };
+
+    await publishApprovedWork(info, publishable, result, durability, hook);
+
+    expect(calls).toEqual(['recorded', 'hook:https://github.com/o/r/pull/9:head-9']);
+    expect(result).toMatchObject({ success: true, finalStatus: 'approved', prUrl: 'https://github.com/o/r/pull/9' });
+  });
+
+  it('keeps the publication a success when the review itself fails', async () => {
+    commitAndCreatePRWithHead.mockResolvedValue({ prUrl: 'https://github.com/o/r/pull/10', headSha: 'head-10' });
+    const result: { success: boolean; finalStatus: string; prUrl?: string } = { success: true, finalStatus: 'approved' };
+
+    await publishApprovedWork(info, publishable, result, undefined, async () => { throw new Error('reviewer adapter down'); });
+
+    expect(result).toMatchObject({ success: true, finalStatus: 'approved', prUrl: 'https://github.com/o/r/pull/10' });
+  });
+});
+
+// Measured 2026-09-10 (AGT-4278): 5 of 5 draft publications carried no reviewer
+// verdict, because this path took no hook at all. Drafts are what runs that
+// STOPPED emit — the least finished work the daemon produces.
+describe('parked publication is reviewed too (AGT-4278)', () => {
+  const info = { worktreePath: '/tmp/w', originalPath: '/tmp/r', branchName: 'swarm/AGT-1', issueId: 'AGT-1' };
+  const publishable = { id: 'task-1', issueIdentifier: 'AGT-1', title: 'Parked' };
+  const parked = { operatorPark: { code: 'ask_human', reason: 'needs a decision' } };
+
+  it('hands the reviewer the published draft, with the sha it can dedup on', async () => {
+    commitAndCreatePRWithHead.mockResolvedValue({ prUrl: 'https://github.com/o/r/pull/42', headSha: 'head-42' });
+    const durability = {
+      beforePublish: vi.fn(async () => true),
+      onPublication: vi.fn(async () => true),
+    } as unknown as ExecutionDurabilityHooks;
+    const hook = vi.fn(async () => {});
+
+    const published = await publishParkedIfNeeded(info, publishable, parked, durability, hook);
+
+    expect(published).toBe(true);
+    expect(hook).toHaveBeenCalledTimes(1);
+    expect(hook.mock.calls[0][0]).toMatchObject({
+      prUrl: 'https://github.com/o/r/pull/42', headSha: 'head-42',
+    });
+  });
+
+  it('does not review what the lease fence refused to publish', async () => {
+    const durability = {
+      beforePublish: vi.fn(async () => false),
+      onPublication: vi.fn(async () => true),
+    } as unknown as ExecutionDurabilityHooks;
+    const hook = vi.fn(async () => {});
+
+    await publishParkedIfNeeded(info, publishable, parked, durability, hook);
+
+    expect(commitAndCreatePRWithHead).not.toHaveBeenCalled();
+    expect(hook).not.toHaveBeenCalled();
+  });
+
+  it('does not review a publication the durable attach rejected', async () => {
+    // A stale executor's PR exists but is not ours to speak for.
+    commitAndCreatePRWithHead.mockResolvedValue({ prUrl: 'https://github.com/o/r/pull/43', headSha: 'head-43' });
+    const durability = {
+      beforePublish: vi.fn(async () => true),
+      onPublication: vi.fn(async () => false),
+    } as unknown as ExecutionDurabilityHooks;
+    const hook = vi.fn(async () => {});
+
+    await publishParkedIfNeeded(info, publishable, parked, durability, hook);
+
+    expect(hook).not.toHaveBeenCalled();
+  });
+
+  it('does not review a publication that never happened', async () => {
+    commitAndCreatePRWithHead.mockRejectedValue(new Error('No commits to create PR from'));
+    const durability = {
+      beforePublish: vi.fn(async () => true),
+      onPublication: vi.fn(async () => true),
+    } as unknown as ExecutionDurabilityHooks;
+    const hook = vi.fn(async () => {});
+
+    await publishParkedIfNeeded(info, publishable, parked, durability, hook);
+
+    expect(hook).not.toHaveBeenCalled();
+  });
+
+  it('reports a throwing reviewer as a review failure, not as a failed publication', async () => {
+    commitAndCreatePRWithHead.mockResolvedValue({ prUrl: 'https://github.com/o/r/pull/44', headSha: 'head-44' });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const durability = {
+      beforePublish: vi.fn(async () => true),
+      onPublication: vi.fn(async () => true),
+    } as unknown as ExecutionDurabilityHooks;
+    const hook = vi.fn(async () => { throw new Error('reviewer exploded'); });
+
+    await expect(publishParkedIfNeeded(info, publishable, parked, durability, hook)).resolves.toBe(true);
+
+    const lines = warn.mock.calls.map(c => String(c[0]));
+    expect(lines.some(l => l.includes('Post-publication review failed'))).toBe(true);
+    expect(lines.some(l => l.includes('Could not publish parked work'))).toBe(false);
+  });
+});
+
+describe('approved publish, lease fence rejection (cgf-portal AX-1020, 2026-08-31)', () => {
+  // Losing beforePublish did not set failureDetail. pickPipelineFailureDetail
+  // then fell back to lastReviewFeedback — a reviewer's APPROVAL text recorded
+  // as if it were the failure, twice, on a run that was actually blocked by
+  // the lease fence for reasons the ledger never captured.
+  it('records the fence, not the reviewer\'s last word, as the failure cause', async () => {
+    const durability = { beforePublish: vi.fn(async () => false), onPublication: vi.fn() } as unknown as ExecutionDurabilityHooks;
+    const result: { success: boolean; finalStatus: string; failureDetail?: string; lastReviewFeedback?: string } = {
+      success: true,
+      finalStatus: 'approved',
+      lastReviewFeedback: '검증 근거를 확인했습니다... 리뷰 결론은 승인입니다.',
+    };
+
+    await publishApprovedWork(
+      { worktreePath: '/tmp/w', originalPath: '/tmp/r', branchName: 'swarm/AX-1020', issueId: 'AX-1020' },
+      { id: 'task-1', issueIdentifier: 'AX-1020', title: 'Verify' },
+      result,
+      durability,
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.finalStatus).toBe('infra_error');
+    expect(result.failureDetail).toMatch(/^publication: lease fence rejected/);
+    expect(commitAndCreatePRWithHead).not.toHaveBeenCalled();
+  });
+});
+
+describe('parked-work draft publication', () => {
+  const info = { worktreePath: '/tmp/w', originalPath: '/tmp/r', branchName: 'swarm/AGT-3844-ci-1', issueId: 'AGT-3844' };
+  const publishable = { id: 'task-1', issueIdentifier: 'AGT-3844', title: 'CI suite reserve', fileScope: ['tests/'], fileScopeSource: 'drafted' as const };
+
+  // The draft exists so the operator can see the branch. Enforcing the write
+  // scope here only hides it: AGT-3844 parked on that fence (2026-09-02)
+  // holding 42 commits whose net diff is four files, and published nothing.
+  it('publishes the branch without the write-scope fence', async () => {
+    commitAndCreatePRWithHead.mockResolvedValue({ prUrl: 'https://github.com/o/r/pull/21', headSha: 'abc' });
+
+    await publishParkedWork(info, publishable, undefined);
+
+    expect(commitAndCreatePRWithHead).toHaveBeenCalledWith(
+      info, publishable.title, 'AGT-3844', expect.any(String),
+      { draft: true },
+    );
+  });
+
+  it('publishes a park once, whichever side of the approved publish it happened on', async () => {
+    commitAndCreatePRWithHead.mockResolvedValue({ prUrl: 'https://github.com/o/r/pull/22', headSha: 'abc' });
+    const parked = { finalStatus: 'failed', operatorPark: { code: 'publication_scope_mismatch', reason: 'r' } };
+
+    expect(await publishParkedIfNeeded(info, publishable, parked, undefined)).toBe(true);
+    expect(await publishParkedIfNeeded(info, publishable, { finalStatus: 'failed' }, undefined)).toBe(false);
+    expect(await publishParkedIfNeeded(null, publishable, parked, undefined)).toBe(false);
+    expect(commitAndCreatePRWithHead).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats an operator park as a run that stopped for a person', () => {
+    expect(shouldPublishParkedWork(true, { finalStatus: 'failed', operatorPark: { code: 'worker_no_changes', reason: 'r' } })).toBe(true);
+    expect(shouldPublishParkedWork(true, { finalStatus: 'waiting_on_operator' })).toBe(true);
+    expect(shouldPublishParkedWork(true, { finalStatus: 'failed' })).toBe(false);
+    // A published run and a quarantined sandbox outcome still never publish.
+    expect(shouldPublishParkedWork(true, { finalStatus: 'waiting_on_operator', prUrl: 'https://x/1' })).toBe(false);
+    expect(shouldPublishParkedWork(true, { finalStatus: 'waiting_on_operator', workerResult: { executionOutcomeUnknown: true } })).toBe(false);
+  });
+});
+
+describe('publication failure classification', () => {
+  const info = { worktreePath: '/tmp/w', originalPath: '/tmp/r', branchName: 'swarm/AGT-4158', issueId: 'AGT-4158' };
+  const publishable = { id: 'task-1', issueIdentifier: 'AGT-4158', title: 'Artifact cohort producer', fileScope: ['src/vega_plugins/eval/'], fileScopeSource: 'drafted' as const };
+
+  it('parks a publication-scope rejection for the operator instead of retrying it', async () => {
+    commitAndCreatePRWithHead.mockRejectedValue(new PublicationScopeMismatchError(['benchmarks/artifact_cohort.py', 'uv.lock']));
+    const result: { success: boolean; finalStatus: string; failureDetail?: string; operatorPark?: { code: string; reason: string } } = { success: true, finalStatus: 'approved' };
+
+    await publishApprovedWork(info, publishable, result, undefined);
+
+    expect(result.success).toBe(false);
+    expect(result.finalStatus).toBe('failed');
+    expect(result.operatorPark).toEqual({
+      code: PUBLICATION_SCOPE_PARK_REASON,
+      reason: expect.stringContaining('benchmarks/artifact_cohort.py, uv.lock'),
+    });
+    expect(result.failureDetail).toMatch(/^publication: publication-scope: /);
+  });
+
+  it('counts a branch with nothing to publish as the attempt failing, not the infrastructure', async () => {
+    commitAndCreatePRWithHead.mockRejectedValue(new Error('No commits to create PR from - branch has no changes compared to main'));
+    const result: { success: boolean; finalStatus: string; failureDetail?: string; operatorPark?: unknown } = { success: true, finalStatus: 'approved' };
+
+    await publishApprovedWork(info, publishable, result, undefined);
+
+    expect(result).toMatchObject({ success: false, finalStatus: 'failed', failureDetail: expect.stringContaining('No commits to create PR from') });
+    expect(result.operatorPark).toBeUndefined();
+  });
+
+  // cgf-portal AX-874, 2026-09-02: four consecutive attempts ended "No commits"
+  // and were counted as failures; the worker's own noChangesReason never
+  // reached the ledger, the Linear comment, or the operator.
+  it('parks a worker that finished with an explicit noChangesReason and nothing to publish', async () => {
+    commitAndCreatePRWithHead.mockRejectedValue(new Error('No commits to create PR from - branch has no changes compared to main'));
+    const result: { success: boolean; finalStatus: string; failureDetail?: string; operatorPark?: { code: string; reason: string }; workerResult?: { noChangesReason?: string } } = {
+      success: true,
+      finalStatus: 'approved',
+      workerResult: { noChangesReason: 'settlement tags are already split in ledger.py' },
+    };
+
+    await publishApprovedWork(info, publishable, result, undefined);
+
+    expect(result.success).toBe(false);
+    expect(result.finalStatus).toBe('failed');
+    expect(result.operatorPark).toEqual({
+      code: WORKER_NO_CHANGES_PARK_REASON,
+      reason: 'Worker finished without edits: settlement tags are already split in ledger.py',
+    });
+    expect(result.failureDetail).toBe('publication: No commits to create PR from - branch has no changes compared to main — worker: settlement tags are already split in ledger.py');
+  });
+
+  it('keeps every other publication failure a retryable infra error, with the cause recorded', async () => {
+    commitAndCreatePRWithHead.mockRejectedValue(new Error('gh: HTTP 502 Bad Gateway'));
+    const result: { success: boolean; finalStatus: string; failureDetail?: string; operatorPark?: unknown } = { success: true, finalStatus: 'approved' };
+
+    await publishApprovedWork(info, publishable, result, undefined);
+
+    expect(result).toMatchObject({ success: false, finalStatus: 'infra_error', failureDetail: 'publication: gh: HTTP 502 Bad Gateway' });
+    expect(result.operatorPark).toBeUndefined();
+  });
+});
+
+describe('publishStuckWork — terminal parks publish instead of holding', () => {
+  const ctx = { worktreePath: '/tmp/w', repoRoot: '/tmp/r', branchName: 'swarm/AGT-1' };
+  const task = { id: 'task-1', issueId: 'issue-1', issueIdentifier: 'AGT-1', title: 'Do the thing' };
+
+  it('opens a draft PR for a run that exhausted its retries', async () => {
+    commitAndCreatePRWithHead.mockResolvedValue({ prUrl: 'https://github.com/o/r/pull/9', headSha: 'sha' });
+
+    const prUrl = await publishStuckWork(ctx, task, 'autonomous execution failed 4 times');
+
+    expect(prUrl).toBe('https://github.com/o/r/pull/9');
+    const [info, title, identifier, body, options] = commitAndCreatePRWithHead.mock.calls[0];
+    expect(info).toMatchObject({ worktreePath: '/tmp/w', originalPath: '/tmp/r', branchName: 'swarm/AGT-1' });
+    expect(title).toBe('Do the thing');
+    expect(identifier).toBe('AGT-1');
+    // The park reason belongs in the PR body: it is why a human is being asked to look.
+    expect(body).toContain('autonomous execution failed 4 times');
+    // Never ready: nothing reviewed this, and CI must not run on known-incomplete work.
+    expect(options).toMatchObject({ draft: true });
+  });
+
+  it('sweeps up uncommitted work, because this worktree is about to be deleted', async () => {
+    commitAndCreatePRWithHead.mockResolvedValue({ prUrl: 'https://github.com/o/r/pull/9', headSha: 'sha' });
+
+    await publishStuckWork(ctx, task, 'stuck');
+
+    // committedOnly would publish only what the pre-cleanup WIP commit managed
+    // to capture — and that commit swallows its own failures.
+    expect(commitAndCreatePRWithHead.mock.calls[0][4]).not.toMatchObject({ committedOnly: true });
+  });
+
+  it('reports no URL, and does not throw, when the run produced no commits', async () => {
+    commitAndCreatePRWithHead.mockRejectedValue(new Error('No commits to create PR from - branch has no changes'));
+
+    await expect(publishStuckWork(ctx, task, 'reviewer rejected 3 attempts')).resolves.toBeUndefined();
+  });
+
+  it('swallows a publication failure — cleanup and the park must proceed regardless', async () => {
+    commitAndCreatePRWithHead.mockRejectedValue(new Error('gh: could not reach github.com'));
+
+    await expect(publishStuckWork(ctx, task, 'stuck')).resolves.toBeUndefined();
+  });
+
+  // This used to enforce a declared scope and drop an inferred one. Both now
+  // publish: the worktree is deleted moments after this call, so a fenced
+  // refusal does not protect the operator's instruction — it destroys the work
+  // that would have shown them it was broken. A draft PR merges nothing.
+  it('publishes the branch as a draft without a write-scope fence, whatever the scope source', async () => {
+    for (const fileScopeSource of ['declared', 'drafted', 'inferred'] as const) {
+      commitAndCreatePRWithHead.mockResolvedValue({ prUrl: 'https://github.com/o/r/pull/9', headSha: 'sha' });
+
+      await publishStuckWork(ctx, { ...task, fileScope: ['src/a.ts'], fileScopeSource }, 'stuck');
+
+      expect(commitAndCreatePRWithHead.mock.calls.at(-1)?.[4]).toEqual({ draft: true });
+    }
+  });
+});
+
+describe('unfinished-run publication (AGT-4664)', () => {
+  const info = { worktreePath: '/tmp/w', originalPath: '/tmp/r', branchName: 'swarm/AX-1774', issueId: 'AX-1774' };
+  const task = { id: 'task-1', issueIdentifier: 'AX-1774', title: 'Reconcile ledger', fileScope: ['src/'], fileScopeSource: 'drafted' as const };
+  const pr = { prUrl: 'https://github.com/o/r/pull/31', headSha: 'abc' };
+
+  describe('shouldPublishUnfinishedWork', () => {
+    it.each(['failed', 'rejected', 'infra_error', 'rate_limited'])('publishes a %s run that has a worktree', (finalStatus) => {
+      expect(shouldPublishUnfinishedWork(true, { success: false, finalStatus })).toBe(true);
+    });
+
+    it.each(['cancelled', 'superseded', 'decomposed', 'deferred', 'approved', 'waiting_on_operator', undefined])(
+      'does not publish a %s run',
+      (finalStatus) => {
+        expect(shouldPublishUnfinishedWork(true, { finalStatus })).toBe(false);
+      },
+    );
+
+    it('does not publish without a worktree', () => {
+      expect(shouldPublishUnfinishedWork(false, { finalStatus: 'failed' })).toBe(false);
+    });
+
+    it('leaves an operator park to the parked path', () => {
+      expect(shouldPublishUnfinishedWork(true, { finalStatus: 'failed', operatorPark: { code: 'worker_no_changes', reason: 'r' } })).toBe(false);
+    });
+
+    it('does not publish a sandbox outcome it cannot trust or a run that already has a PR', () => {
+      expect(shouldPublishUnfinishedWork(true, { finalStatus: 'failed', workerResult: { executionOutcomeUnknown: true } })).toBe(false);
+      expect(shouldPublishUnfinishedWork(true, { finalStatus: 'failed', prUrl: 'https://x/1' })).toBe(false);
+    });
+
+    it('does not publish for a lifecycle-fence failure or a run that was approved going in', () => {
+      expect(shouldPublishUnfinishedWork(true, { finalStatus: 'infra_error' }, { lifecycleFailed: true })).toBe(false);
+      expect(shouldPublishUnfinishedWork(true, { finalStatus: 'infra_error' }, { approvedAttempt: true })).toBe(false);
+    });
+  });
+
+  describe('publishUnfinishedWork', () => {
+    it('opens a draft with the status and last failure, without attaching it to the ledger', async () => {
+      commitAndCreatePRWithHead.mockResolvedValue(pr);
+      const onPublication = vi.fn(async () => true);
+      const durability = { beforePublish: vi.fn(async () => true), onPublication } as unknown as ExecutionDurabilityHooks;
+
+      const url = await publishUnfinishedWork(info, task, { finalStatus: 'rejected', failureDetail: 'reviewer: tests missing\nfor the new branch' }, durability);
+
+      expect(url).toBe(pr.prUrl);
+      expect(commitAndCreatePRWithHead).toHaveBeenCalledWith(
+        info, task.title, 'AX-1774',
+        expect.stringMatching(/ended as `rejected`[\s\S]*Last failure: reviewer: tests missing for the new branch/),
+        { draft: true },
+      );
+      // No PR on the ledger row: a non-approved result with one becomes NEEDS_RECONCILE and stops the retry.
+      expect(onPublication).not.toHaveBeenCalled();
+    });
+
+    it('bounds the failure text and survives a missing one', async () => {
+      commitAndCreatePRWithHead.mockResolvedValue(pr);
+
+      await publishUnfinishedWork(info, task, { finalStatus: 'failed', failureDetail: 'x'.repeat(2_000) }, undefined);
+      await publishUnfinishedWork(info, task, { finalStatus: 'failed' }, undefined);
+
+      const bodies = commitAndCreatePRWithHead.mock.calls.map((call) => String(call[3]));
+      expect(bodies[0].length).toBeLessThan(900);
+      expect(bodies[1]).toContain('no failure detail was recorded');
+    });
+
+    it('publishes nothing when the lease fence refuses', async () => {
+      const durability = { beforePublish: vi.fn(async () => false), onPublication: vi.fn() } as unknown as ExecutionDurabilityHooks;
+
+      expect(await publishUnfinishedWork(info, task, { finalStatus: 'failed' }, durability)).toBeUndefined();
+      expect(commitAndCreatePRWithHead).not.toHaveBeenCalled();
+    });
+
+    it('swallows a branch with nothing on it and any publication failure', async () => {
+      commitAndCreatePRWithHead.mockRejectedValueOnce(new Error('No commits to create PR from - branch has no changes compared to main'));
+      expect(await publishUnfinishedWork(info, task, { finalStatus: 'failed' }, undefined)).toBeUndefined();
+
+      commitAndCreatePRWithHead.mockRejectedValueOnce(new Error('gh: HTTP 502'));
+      expect(await publishUnfinishedWork(info, task, { finalStatus: 'failed' }, undefined)).toBeUndefined();
+    });
+  });
+
+  describe('publishFinishedRun', () => {
+    const noHook = () => undefined;
+
+    it('publishes a failed run once, as a draft, and leaves its result alone', async () => {
+      commitAndCreatePRWithHead.mockResolvedValue(pr);
+      const result: { success: boolean; finalStatus: string; prUrl?: string; failureDetail?: string } = { success: false, finalStatus: 'failed', failureDetail: 'tests red' };
+
+      await publishFinishedRun(info, task, result, undefined, noHook);
+
+      expect(commitAndCreatePRWithHead).toHaveBeenCalledTimes(1);
+      expect(commitAndCreatePRWithHead.mock.calls[0][4]).toEqual({ draft: true });
+      // Setting prUrl here would turn the retry into NEEDS_RECONCILE.
+      expect(result).toEqual({ success: false, finalStatus: 'failed', failureDetail: 'tests red' });
+    });
+
+    it('publishes an approved run through the reviewed path only', async () => {
+      commitAndCreatePRWithHead.mockResolvedValue(pr);
+      const result: { success: boolean; finalStatus: string; prUrl?: string } = { success: true, finalStatus: 'approved' };
+
+      await publishFinishedRun(info, task, result, undefined, noHook);
+
+      expect(commitAndCreatePRWithHead).toHaveBeenCalledTimes(1);
+      expect(commitAndCreatePRWithHead.mock.calls[0][4]).not.toMatchObject({ draft: true });
+      expect(result.prUrl).toBe(pr.prUrl);
+    });
+
+    // A push or `gh` error in the reviewed publish rewrites the status to
+    // infra_error. Republishing that as a draft would hide approved work behind
+    // a draft and skip the reviewed retry that fixes it.
+    it('does not republish approved work as a draft when the reviewed publish fails', async () => {
+      commitAndCreatePRWithHead.mockRejectedValue(new Error('gh: HTTP 502'));
+      const result: { success: boolean; finalStatus: string; failureDetail?: string } = { success: true, finalStatus: 'approved' };
+
+      await publishFinishedRun(info, task, result, undefined, noHook);
+
+      expect(result).toMatchObject({ success: false, finalStatus: 'infra_error' });
+      expect(commitAndCreatePRWithHead).toHaveBeenCalledTimes(1);
+    });
+
+    it('publishes a scope-mismatch park once, through the parked path', async () => {
+      commitAndCreatePRWithHead
+        .mockRejectedValueOnce(new PublicationScopeMismatchError(['uv.lock']))
+        .mockResolvedValueOnce(pr);
+      const result: { success: boolean; finalStatus: string; operatorPark?: unknown } = { success: true, finalStatus: 'approved' };
+
+      await publishFinishedRun(info, task, result, undefined, noHook);
+
+      expect(result.operatorPark).toBeDefined();
+      // One rejected reviewed attempt and one draft; the unfinished path stays out.
+      expect(commitAndCreatePRWithHead).toHaveBeenCalledTimes(2);
+      expect(commitAndCreatePRWithHead.mock.calls[1][4]).toEqual({ draft: true });
+    });
+
+    it('publishes a run parked before the approved publish once, not twice', async () => {
+      commitAndCreatePRWithHead.mockResolvedValue(pr);
+      const result = { success: false, finalStatus: 'failed', operatorPark: { code: 'worker_no_changes', reason: 'r' } };
+
+      await publishFinishedRun(info, task, result, undefined, noHook);
+
+      expect(commitAndCreatePRWithHead).toHaveBeenCalledTimes(1);
+    });
+
+    it('puts the ledger-style failure summary in the draft body when the result carries none', async () => {
+      commitAndCreatePRWithHead.mockResolvedValue(pr);
+      // A reviewer-rejection stall sets no failureDetail on the result.
+      const result = { success: false, finalStatus: 'failed' };
+
+      await publishFinishedRun(info, task, result, undefined, noHook, undefined, { failureSummary: 'reviewer: the new route has no test' });
+
+      expect(String(commitAndCreatePRWithHead.mock.calls[0][3])).toContain('Last failure: reviewer: the new route has no test');
+    });
+
+    it('publishes nothing for a lifecycle-fence failure', async () => {
+      const result = { success: false, finalStatus: 'infra_error', failureDetail: 'lease lost' };
+
+      await publishFinishedRun(info, task, result, undefined, noHook, undefined, { lifecycleFailed: true });
+
+      expect(commitAndCreatePRWithHead).not.toHaveBeenCalled();
+    });
+
+    it.each(['cancelled', 'superseded', 'decomposed', 'deferred'])('publishes nothing for a %s run', async (finalStatus) => {
+      await publishFinishedRun(info, task, { success: false, finalStatus }, undefined, noHook);
+
+      expect(commitAndCreatePRWithHead).not.toHaveBeenCalled();
+    });
+
+    it('publishes nothing without a worktree', async () => {
+      await publishFinishedRun(null, task, { success: false, finalStatus: 'failed' }, undefined, noHook);
+
+      expect(commitAndCreatePRWithHead).not.toHaveBeenCalled();
+    });
+
+    it('runs no post-publication review for the unfinished draft', async () => {
+      commitAndCreatePRWithHead.mockResolvedValue(pr);
+      const hook = vi.fn(async () => {});
+
+      await publishFinishedRun(info, task, { success: false, finalStatus: 'failed' }, undefined, () => hook);
+
+      // A review per failed attempt is one LLM call each, and on rate_limited it only hits the limit again.
+      expect(commitAndCreatePRWithHead).toHaveBeenCalledTimes(1);
+      expect(hook).not.toHaveBeenCalled();
+    });
+  });
+});

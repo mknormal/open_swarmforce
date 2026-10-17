@@ -1,0 +1,1243 @@
+// ============================================
+// OpenSwarm - Runner State Utilities
+// Task state persistence + project info query
+// ============================================
+
+import {
+  existsSync,
+  readFileSync,
+  mkdirSync,
+  openSync,
+  closeSync,
+  writeFileSync,
+  unlinkSync,
+  fsyncSync,
+  statSync,
+} from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
+import { join, dirname, isAbsolute, relative, sep } from 'node:path';
+import { taskEventKey, type TaskItem } from '../orchestration/decisionEngine.js';
+import type { PipelineResult } from '../agents/pairPipelineTypes.js';
+import type { VerifyEvidence } from '../verify/runner.js';
+import { atomicWriteFileSync } from '../support/atomicFile.js';
+import { withFileLockSync } from '../support/fileLock.js';
+import {
+  PROCESS_STARTED_AT_MS,
+  isProofCapableSpace,
+  processAppearsAlive,
+  processNamespaceId,
+  sameProcessNamespace,
+} from '../support/processLiveness.js';
+
+/**
+ * Write-temp-then-rename instead of an in-place write, so a crash mid-write (or
+ * two processes racing on the same path) never leaves a truncated/corrupt JSON
+ * state file — a reader always sees either the old complete file or the new
+ * complete one, never a half-written one. The single-instance daemon guard
+ * (service.ts, INT-2570) is the primary defense against concurrent writers on
+ * these specific files; this is the cheap defense-in-depth for the crash case.
+ */
+
+type RunnerLockOwner = { pid: number; token: string; ns?: string | null };
+
+function readRunnerLockOwner(lockPath: string): RunnerLockOwner | null {
+  try {
+    const value = JSON.parse(readFileSync(lockPath, 'utf8')) as Partial<RunnerLockOwner>;
+    return Number.isInteger(value.pid) && (value.pid ?? 0) > 0 && typeof value.token === 'string'
+      ? {
+        pid: value.pid!,
+        token: value.token,
+        ns: value.ns === null ? null : typeof value.ns === 'string' ? value.ns : undefined,
+      }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Release a runner-state lock only when we can prove its owner is gone in OUR
+ * pid namespace. A lock from another namespace (or with no namespace recorded)
+ * is left alone — reclaiming it would free a live remote owner's lock.
+ *
+ * Returns true when the lock file was removed.
+ */
+export function releaseStaleLock(lockPath: string): boolean {
+  if (!existsSync(lockPath)) return false;
+  const owner = readRunnerLockOwner(lockPath);
+  if (!owner) {
+    // Malformed lock: only reclaim when aged past a short stale window.
+    try {
+      if (Date.now() - statSync(lockPath).mtimeMs > 30_000) {
+        unlinkSync(lockPath);
+        return true;
+      }
+    } catch {
+      return false;
+    }
+    return false;
+  }
+  // Namespace proof required: never release a lock we cannot judge.
+  if (!isProofCapableSpace(owner.ns ?? undefined) || !sameProcessNamespace(owner.ns ?? undefined)) {
+    return false;
+  }
+  if (processAppearsAlive(owner.pid)) return false;
+  try {
+    unlinkSync(lockPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Exclusive file lock around a runner-state mutation. Uses the same
+ * owner-safe stale recovery as `releaseStaleLock`.
+ */
+export function withRunnerStateLock<T>(stateFile: string, operation: () => T): T {
+  const lockPath = `${stateFile}.lock`;
+  ensureParentDir(stateFile);
+  const deadline = Date.now() + 5_000;
+  const token = randomUUID();
+  let lockFd: number | undefined;
+
+  while (lockFd === undefined) {
+    try {
+      lockFd = openSync(lockPath, 'wx', 0o600);
+      writeFileSync(lockFd, JSON.stringify({
+        pid: process.pid,
+        token,
+        ns: processNamespaceId() ?? null,
+      }), 'utf8');
+      fsyncSync(lockFd);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'EEXIST') throw error;
+      releaseStaleLock(lockPath);
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for runner state lock: ${lockPath}`);
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+  }
+
+  try {
+    return operation();
+  } finally {
+    closeSync(lockFd);
+    try {
+      if (readRunnerLockOwner(lockPath)?.token === token) unlinkSync(lockPath);
+    } catch {
+      // Best-effort unlock.
+    }
+  }
+}
+/** Check if a resolved path matches or is under any enabled project path */
+export function isPathEnabled(resolvedPath: string, enabledProjects: Set<string>): boolean {
+  for (const enabled of enabledProjects) {
+    const rel = relative(enabled, resolvedPath);
+    if (rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))) return true;
+  }
+  return false;
+}
+
+// State-file paths honor env overrides so tests (and alternate deployments) can
+// redirect them off the real ~/.claude state — an unset override keeps the exact
+// legacy path (backward compatible). Without this, every runner integration test
+// wrote the LIVE daemon's state files (observed: ISSUE-1 accrued 184 phantom failures),
+// which also made those tests flaky. Read at import; tests stub the env then re-import.
+// NOTE: these use OPENSWARM_RUNNER_* names, deliberately DISTINCT from the canonical
+// task store's OPENSWARM_TASK_STATE_FILE (src/taskState/store.ts) — this legacy runner
+// state has a different schema ({completed,failed,retryTimes,…}), so sharing the env
+// var would let one store silently overwrite the other's file. (INT-2543)
+export const TASK_STATE_FILE = process.env.OPENSWARM_RUNNER_TASK_STATE_FILE || join(homedir(), '.claude', 'openswarm-task-state.json');
+export const PIPELINE_HISTORY_FILE = process.env.OPENSWARM_RUNNER_PIPELINE_HISTORY_FILE || join(homedir(), '.claude', 'openswarm-pipeline-history.json');
+export const REJECTION_STATE_FILE = process.env.OPENSWARM_RUNNER_REJECTION_STATE_FILE || join(homedir(), '.claude', 'openswarm-rejection-state.json');
+export const DECOMPOSITION_STATE_FILE = process.env.OPENSWARM_RUNNER_DECOMPOSITION_STATE_FILE || join(homedir(), '.claude', 'openswarm-decomposition-state.json');
+export const DAILY_PACE_FILE = join(homedir(), '.openswarm', 'daily-pace.json');
+export const PROJECT_SELECTION_FILE = join(homedir(), '.openswarm', 'project-selection.json');
+const MAX_PIPELINE_HISTORY = 100;
+const MAX_REJECTION_ATTEMPTS = 3;
+
+// 5시간 롤링 윈도우 기반 프로젝트별 pace 제어
+// Claude Max는 5시간마다 quota가 리프레시되므로 이에 맞춤
+
+const WINDOW_MS = 5 * 60 * 60 * 1000; // 5시간
+
+export interface ProjectPaceEntry {
+  completedAt: string; // ISO-8601
+  costUsd?: number;
+}
+
+export interface PaceState {
+  projects: Record<string, ProjectPaceEntry[]>;
+  updatedAt: string;
+}
+
+export interface DailyPaceState {
+  completedToday: number;
+  dateKey: string;
+  lastCompletionAt: string | null;
+  projectCounts: Record<string, number>;
+}
+
+let paceState: PaceState | null = null;
+
+function ensurePaceDir(): void {
+  const dir = join(homedir(), '.openswarm');
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true });
+  }
+}
+
+function ensureParentDir(file: string): void {
+  mkdirSync(dirname(file), { recursive: true });
+}
+
+function ensurePaceLoaded(): PaceState {
+  if (paceState) return paceState;
+  try {
+    if (existsSync(DAILY_PACE_FILE)) {
+      const raw = readFileSync(DAILY_PACE_FILE, 'utf8');
+      paceState = JSON.parse(raw) as PaceState;
+      if (!paceState!.projects) paceState!.projects = {};
+    } else {
+      paceState = { projects: {}, updatedAt: new Date().toISOString() };
+    }
+  } catch {
+    paceState = { projects: {}, updatedAt: new Date().toISOString() };
+  }
+  return paceState!;
+}
+
+function savePace(): void {
+  try {
+    ensurePaceDir();
+    atomicWriteFileSync(DAILY_PACE_FILE, JSON.stringify(paceState, null, 2));
+  } catch (err) {
+    console.warn('[Pace] Failed to save:', err);
+  }
+}
+
+// Persisted dashboard/CLI project selection so "disable all" survives a daemon
+// restart (otherwise enabledProjects resets and the run-all fallback kicks back
+// in). (INT-2208) `touched` mirrors AutonomousRunner.projectSelectionTouched.
+export interface ProjectSelection {
+  enabled: string[];
+  touched: boolean;
+}
+
+export function loadProjectSelection(file: string = PROJECT_SELECTION_FILE): ProjectSelection {
+  try {
+    if (existsSync(file)) {
+      const data = JSON.parse(readFileSync(file, 'utf8'));
+      return { enabled: Array.isArray(data.enabled) ? data.enabled : [], touched: !!data.touched };
+    }
+  } catch {
+    /* corrupt/unreadable → safe default below */
+  }
+  return { enabled: [], touched: false };
+}
+
+export function saveProjectSelection(sel: ProjectSelection, file: string = PROJECT_SELECTION_FILE): void {
+  try {
+    ensureParentDir(file);
+    withFileLockSync(`${file}.lock`, () => {
+      atomicWriteFileSync(file, JSON.stringify(sel, null, 2));
+    });
+  } catch (err) {
+    console.warn('[ProjectSelection] Failed to save:', err);
+  }
+}
+
+function pruneOldEntries(entries: ProjectPaceEntry[]): ProjectPaceEntry[] {
+  const cutoff = Date.now() - WINDOW_MS;
+  return entries.filter(e => new Date(e.completedAt).getTime() > cutoff);
+}
+
+// Cap helpers (getProjectWindowCount / canProjectAcceptTask / getTotalWindowCount)
+// were removed with the per-project 5h cap (INT-2317). Completion recording stays
+// below — daily-pace.json remains useful as a cost/throughput telemetry trail.
+
+export function recordProjectCompletion(projectName: string, costUsd?: number): void {
+  withFileLockSync(`${DAILY_PACE_FILE}.lock`, () => {
+    // Reload under the lock: two processes appending completions would otherwise
+    // each write a snapshot taken before the other's append, dropping it.
+    paceState = null;
+    const state = ensurePaceLoaded();
+    if (!state.projects[projectName]) state.projects[projectName] = [];
+    state.projects[projectName] = pruneOldEntries(state.projects[projectName]);
+    state.projects[projectName].push({ completedAt: new Date().toISOString(), costUsd });
+    state.updatedAt = new Date().toISOString();
+    savePace();
+    console.log(`[Pace] ${projectName}: ${state.projects[projectName].length} tasks in 5h window`);
+  });
+}
+
+export function getDailyPaceInfo(): DailyPaceState {
+  const state = ensurePaceLoaded();
+  const projectCounts: Record<string, number> = {};
+  let totalToday = 0;
+  let lastCompletion: string | null = null;
+  const today = new Date().toLocaleDateString('en-CA');
+
+  for (const [name, entries] of Object.entries(state.projects)) {
+    const active = pruneOldEntries(entries);
+    projectCounts[name] = active.length;
+    for (const e of entries) {
+      if (e.completedAt.startsWith(today)) totalToday++;
+      if (!lastCompletion || e.completedAt > lastCompletion) lastCompletion = e.completedAt;
+    }
+  }
+
+  return { completedToday: totalToday, dateKey: today, lastCompletionAt: lastCompletion, projectCounts };
+}
+
+/** Last failure detail per issue — injected into the next attempt's worker
+ * prompt so a re-picked task doesn't repeat the exact mistake the reviewer
+ * already called out (INT-2474). Capped and cleared on success. */
+export interface LastFailureEntry {
+  detail: string;
+  at: string; // ISO-8601
+}
+
+export const MAX_FAILURE_DETAIL_CHARS = 2000;
+/** Enough of the head to keep the banner that names which suite spoke. */
+const FAILURE_DETAIL_HEAD_CHARS = 240;
+const FAILURE_DETAIL_ELISION = '\n… [middle elided] …\n';
+
+export interface TaskState {
+  completedTaskIds: Set<string>;
+  failedTaskCounts: Map<string, number>;
+  failedTaskRetryTimes: Map<string, number>; // issueId → next retry timestamp (ms)
+  lastFailureDetails: Map<string, LastFailureEntry>; // issueId → last failure feedback
+}
+
+/** Placeholder strings that carry zero diagnostic value — never persist these
+ *  as a failure detail when something meaningful is available (INT-2504). */
+const JUNK_DETAILS = new Set([
+  'Unknown error',
+  'No feedback provided',
+  'No summary provided',
+  'Worker execution failed',
+  // t('common.fallback.noSummary') literals — the reviewer parse fallback emits
+  // these as `feedback` and they leaked through as a persisted "detail" (live:
+  // INT-2193 lastFailure === '(no summary)').
+  '(no summary)',
+  '(요약 없음)',
+]);
+
+/**
+ * Pick the first MEANINGFUL failure detail. The old chain
+ * (`workerResult.error || reviewResult.feedback`) let a junk-but-truthy error
+ * string ("Unknown error" from the text-fallback parser) mask the reviewer's
+ * actionable feedback — the retry then got injected with garbage (INT-2504).
+ */
+export function pickFailureDetail(candidates: Array<string | undefined>): string | undefined {
+  for (const c of candidates) {
+    const trimmed = c?.trim();
+    if (trimmed && !JUNK_DETAILS.has(trimmed)) return trimmed;
+  }
+  return undefined;
+}
+
+/**
+ * Keep the head *and* the tail when a detail exceeds the cap.
+ *
+ * Test-runner output is bottom-heavy: pytest, vitest and go test print a
+ * progress banner first and the failure summary last. Slicing the first 2000
+ * characters stored 2000 characters of `....s....` for AX-1556 and dropped
+ * every offending file, the rejected value and the `FAILED …` line, so the
+ * retry's worker prompt carried no signal at all (AGT-4436). The cap itself
+ * stays: the prompt budget is why it exists, and the fix is *which* 2000
+ * characters survive, not how many.
+ */
+export function clipFailureDetail(detail: string, maxChars = MAX_FAILURE_DETAIL_CHARS): string {
+  if (detail.length <= maxChars) return detail;
+  const head = Math.min(FAILURE_DETAIL_HEAD_CHARS, Math.floor(maxChars / 4));
+  const tail = maxChars - head - FAILURE_DETAIL_ELISION.length;
+  if (tail <= 0) return detail.slice(-maxChars);
+  return `${detail.slice(0, head)}${FAILURE_DETAIL_ELISION}${detail.slice(-tail)}`;
+}
+
+/**
+ * Report only the commands that actually failed.
+ *
+ * `TesterResult.output` concatenates every command's tail, passing ones
+ * included, so a run with one failing suite among many spends most of the
+ * budget on `All checks passed!` lines. New failures come first: those are
+ * what blocked the run.
+ */
+function testerEvidenceFailure(evidence: VerifyEvidence[] | undefined): string | undefined {
+  if (!evidence?.length) return undefined;
+  const failing = evidence.filter((item) => item.headStatus === 'fail');
+  if (failing.length === 0) return undefined;
+  const ordered = [...failing].sort((a, b) => Number(b.newFailure) - Number(a.newFailure));
+  return ordered.map((item) => `[${item.command.name}] ${item.rawOutputTail}`).join('\n');
+}
+
+/** Prefer the stage that actually failed over earlier successful feedback. */
+export function pickPipelineFailureDetail(result: PipelineResult): string | undefined {
+  const workerFailure = result.workerResult?.success === false
+    ? pickFailureDetail([
+      result.workerResult.error,
+      result.workerResult.haltReason,
+      result.workerResult.noChangesReason,
+      result.workerResult.summary,
+    ])
+    : undefined;
+  const testerFailure = result.testerResult?.success === false
+    ? pickFailureDetail([
+      result.testerResult.error,
+      testerEvidenceFailure(result.testerResult.verificationEvidence),
+      result.testerResult.output,
+      result.testerResult.failedTests?.join(', '),
+    ])
+    : undefined;
+
+  // Guards, security audit, verification, worktree setup and publication
+  // report through `stages[]` rather than a typed sub-result. Without this
+  // fallback the ledger recorded 57% of one day's failures with no message
+  // at all (vela, 2026-09-01), and the reason was unrecoverable once the
+  // container's log was gone.
+  const failedStage = [...result.stages].reverse().find((stage) => !stage.success);
+  const stageError = failedStage && 'error' in failedStage.result && typeof failedStage.result.error === 'string'
+    ? `${failedStage.stage}: ${failedStage.result.error}`
+    : undefined;
+
+  // An approval is never why a run failed. With the reviewer satisfied, the
+  // cause is a later stage, and reporting the approval instead told the retry
+  // its prior failure was "All hard-gate criteria are evidenced and passing".
+  const reviewFeedback = result.reviewResult?.decision === 'approve'
+    ? []
+    : [result.lastReviewFeedback, result.reviewResult?.feedback];
+  // An infrastructure failure is identified by the stage that died, not by an
+  // earlier revise: the same-fingerprint circuit reads this string, and
+  // reviewer prose differs on every attempt, so led by prose it never trips.
+  const causes = result.finalStatus === 'infra_error'
+    ? [workerFailure, stageError, ...reviewFeedback]
+    : [...reviewFeedback, workerFailure, stageError];
+
+  return pickFailureDetail([
+    // Publication failed after every stage passed: nothing below describes it.
+    result.failureDetail,
+    testerFailure,
+    ...causes,
+    result.stuckReason,
+  ]);
+}
+
+export function recordLastFailureDetail(state: TaskState, issueId: string, detail: string): void {
+  const trimmed = detail.trim();
+  if (!trimmed) return;
+  state.lastFailureDetails.set(issueId, {
+    detail: clipFailureDetail(trimmed),
+    at: new Date().toISOString(),
+  });
+}
+
+export function loadTaskState(state: TaskState): void {
+  try {
+    if (!existsSync(TASK_STATE_FILE)) return;
+    const raw = readFileSync(TASK_STATE_FILE, 'utf8');
+    const data = JSON.parse(raw) as {
+      completed?: string[];
+      failed?: Record<string, number>;
+      retryTimes?: Record<string, number>;
+      lastFailures?: Record<string, LastFailureEntry>;
+    };
+    if (Array.isArray(data.completed)) {
+      for (const id of data.completed) state.completedTaskIds.add(id);
+    }
+    if (data.failed && typeof data.failed === 'object') {
+      for (const [id, count] of Object.entries(data.failed)) {
+        state.failedTaskCounts.set(id, count as number);
+      }
+    }
+    if (data.retryTimes && typeof data.retryTimes === 'object') {
+      for (const [id, time] of Object.entries(data.retryTimes)) {
+        state.failedTaskRetryTimes.set(id, time as number);
+      }
+    }
+    if (data.lastFailures && typeof data.lastFailures === 'object') {
+      for (const [id, entry] of Object.entries(data.lastFailures)) {
+        if (entry && typeof entry.detail === 'string') state.lastFailureDetails.set(id, entry);
+      }
+    }
+    console.log(`[AutonomousRunner] Loaded task state: ${state.completedTaskIds.size} completed, ${state.failedTaskCounts.size} failed`);
+  } catch (err) {
+    console.warn('[AutonomousRunner] Failed to load task state:', err);
+  }
+}
+
+export function saveTaskState(state: TaskState): void {
+  try {
+    withRunnerStateLock(TASK_STATE_FILE, () => {
+      const data = {
+        completed: Array.from(state.completedTaskIds),
+        failed: Object.fromEntries(state.failedTaskCounts),
+        retryTimes: Object.fromEntries(state.failedTaskRetryTimes),
+        lastFailures: Object.fromEntries(state.lastFailureDetails),
+        updatedAt: new Date().toISOString(),
+      };
+      ensureParentDir(TASK_STATE_FILE);
+      atomicWriteFileSync(TASK_STATE_FILE, JSON.stringify(data, null, 2));
+    });
+  } catch (err) {
+    console.warn('[AutonomousRunner] Failed to save task state:', err);
+  }
+}
+
+// Pipeline History (persistent, time-ordered)
+
+export interface PipelineHistoryEntry {
+  sessionId: string;
+  issueIdentifier?: string;
+  issueId?: string;
+  taskTitle: string;
+  projectName?: string;
+  projectPath?: string;
+  success: boolean;
+  finalStatus: string;
+  iterations: number;
+  totalDuration: number;
+  stages: { stage: string; success: boolean; duration: number }[];
+  cost?: { costUsd: number; inputTokens: number; outputTokens: number };
+  prUrl?: string;
+  reviewerFeedback?: string; // Reviewer rejection reason (for debugging)
+  failureCause?: FailureCause;
+  completedAt: string; // ISO-8601
+}
+
+export type FailureCause = 'reviewer-reject' | 'infra' | 'rate-limit' | 'no-changes' | 'gate-fail' | 'timeout' | 'stuck' | 'cancelled';
+
+export interface FailureCauseSignals {
+  success: boolean;
+  finalStatus: string;
+  failureSignal?: 'gate-fail' | 'timeout' | 'stuck';
+  workerFilesChanged?: number;
+  reviewerDecision?: string;
+}
+
+/** Classify only explicit result fields; never infer from reviewer prose. */
+export function classifyFailureCause(signals: FailureCauseSignals): FailureCause | undefined {
+  if (signals.success) return undefined;
+  if (signals.finalStatus === 'cancelled') return 'cancelled';
+  if (signals.finalStatus === 'rate_limited') return 'rate-limit';
+  if (signals.failureSignal === 'timeout') return 'timeout';
+  if (signals.finalStatus === 'infra_error') return 'infra';
+  if (signals.failureSignal === 'stuck') return 'stuck';
+  if (signals.workerFilesChanged === 0) return 'no-changes';
+  if (signals.failureSignal === 'gate-fail') return 'gate-fail';
+  if (signals.finalStatus === 'rejected' || signals.reviewerDecision === 'reject' || signals.reviewerDecision === 'revise') return 'reviewer-reject';
+  return undefined;
+}
+
+export function aggregateFailureCauses(entries: PipelineHistoryEntry[]): Record<FailureCause, number> {
+  const counts: Record<FailureCause, number> = {
+    'reviewer-reject': 0, infra: 0, 'rate-limit': 0, 'no-changes': 0,
+    'gate-fail': 0, timeout: 0, stuck: 0, cancelled: 0,
+  };
+  for (const entry of entries) if (entry.failureCause) counts[entry.failureCause]++;
+  return counts;
+}
+
+// Rejection State (track reviewer rejections per issue)
+
+export interface RejectionEntry {
+  issueId: string;
+  count: number;
+  lastRejection: string; // ISO-8601
+  reasons: string[]; // Last N rejection reasons
+}
+
+export interface RejectionState {
+  rejections: Record<string, RejectionEntry>;
+  updatedAt: string;
+}
+
+// In-memory cache
+let rejectionState: RejectionState | null = null;
+
+function ensureRejectionStateLoaded(): RejectionState {
+  if (rejectionState !== null) return rejectionState;
+  try {
+    if (existsSync(REJECTION_STATE_FILE)) {
+      const raw = readFileSync(REJECTION_STATE_FILE, 'utf8');
+      rejectionState = JSON.parse(raw) as RejectionState;
+    } else {
+      rejectionState = { rejections: {}, updatedAt: new Date().toISOString() };
+    }
+  } catch {
+    rejectionState = { rejections: {}, updatedAt: new Date().toISOString() };
+  }
+  return rejectionState;
+}
+
+export function getRejectionCount(issueId: string): number {
+  const state = ensureRejectionStateLoaded();
+  return state.rejections[issueId]?.count || 0;
+}
+
+export function incrementRejection(issueId: string, reason: string): number {
+  return withFileLockSync(`${REJECTION_STATE_FILE}.lock`, () => {
+    // Cross-process read-modify-write: reload disk state under the lock, or a
+    // concurrent increment's count and reasons are dropped by this write.
+    rejectionState = null;
+    const state = ensureRejectionStateLoaded();
+    const entry = state.rejections[issueId] || {
+      issueId,
+      count: 0,
+      lastRejection: new Date().toISOString(),
+      reasons: [],
+    };
+
+    entry.count++;
+    entry.lastRejection = new Date().toISOString();
+    entry.reasons.push(reason);
+
+    // Keep only last 5 reasons
+    if (entry.reasons.length > 5) {
+      entry.reasons = entry.reasons.slice(-5);
+    }
+
+    state.rejections[issueId] = entry;
+    state.updatedAt = new Date().toISOString();
+
+    try {
+      ensureParentDir(REJECTION_STATE_FILE);
+      atomicWriteFileSync(REJECTION_STATE_FILE, JSON.stringify(state, null, 2));
+    } catch (err) {
+      console.warn('[RejectionState] Failed to save:', err);
+    }
+
+    return entry.count;
+  }, { timeoutMs: 10_000 });
+}
+
+export function clearRejection(issueId: string): void {
+  withFileLockSync(`${REJECTION_STATE_FILE}.lock`, () => {
+    // Reload under the lock so the clear applies to the current disk state,
+    // not a snapshot that another process has already incremented.
+    rejectionState = null;
+    const state = ensureRejectionStateLoaded();
+    delete state.rejections[issueId];
+    state.updatedAt = new Date().toISOString();
+
+    try {
+      ensureParentDir(REJECTION_STATE_FILE);
+      atomicWriteFileSync(REJECTION_STATE_FILE, JSON.stringify(state, null, 2));
+    } catch (err) {
+      console.warn('[RejectionState] Failed to save:', err);
+    }
+  }, { timeoutMs: 10_000 });
+}
+
+export function isRejectionLimitReached(issueId: string): boolean {
+  return getRejectionCount(issueId) >= MAX_REJECTION_ATTEMPTS;
+}
+
+export function getAllRejectionEntries(): RejectionEntry[] {
+  const state = ensureRejectionStateLoaded();
+  return Object.values(state.rejections);
+}
+
+// Decomposition State (track parent-child relationships and daily limits)
+
+export interface DecompositionEntry {
+  issueId: string;
+  parentId?: string; // Parent issue ID (if this is a sub-issue)
+  depth: number; // 0 = root, 1 = child, 2 = grandchild, etc.
+  childrenCount: number; // Number of sub-issues created from this issue
+  createdAt: string; // ISO-8601
+}
+
+/**
+ * Slots promised to one in-flight decomposition, kept in the state file so a
+ * *second process* sees them.
+ *
+ * Deliberately a separate field from `dailyCreationCount`, not folded into it:
+ * `registerDecomposition` charges that count for children that actually exist,
+ * so a hold added there would persist as real spending on every successful
+ * decomposition and a restart would read the inflation as truth for the rest of
+ * the day.
+ */
+export interface DecompositionReservation {
+  /** Process holding the slots. */
+  pid: number;
+  /** Pid space the holder lives in; absent or unknown cannot be proven dead. */
+  ns?: string | null;
+  /** Identity of the holder within its process, so one process can hold twice. */
+  holderId: string;
+  count: number;
+  at: string;
+}
+
+export interface DecompositionState {
+  decompositions: Record<string, DecompositionEntry>;
+  dailyCreationCount: number;
+  dailyCreationDate: string; // YYYY-MM-DD
+  /** In-flight holds, keyed by holder id. Absent on state files from before AGT-3468. */
+  reservations?: Record<string, DecompositionReservation>;
+  updatedAt: string;
+}
+
+// In-memory cache
+let decompositionState: DecompositionState | null = null;
+
+/**
+ * Identity of this process's holds within the state file. A pid alone is not
+ * enough: a pid can be reused after a restart, and one process can hold several
+ * reservations at once.
+ */
+const reservationToken = randomUUID();
+
+function persistDecompositionState(state: DecompositionState): void {
+  ensureParentDir(DECOMPOSITION_STATE_FILE);
+  atomicWriteFileSync(DECOMPOSITION_STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+function ensureDecompositionStateLoaded(): DecompositionState {
+  if (decompositionState !== null) return decompositionState;
+  try {
+    if (existsSync(DECOMPOSITION_STATE_FILE)) {
+      const raw = readFileSync(DECOMPOSITION_STATE_FILE, 'utf8');
+      decompositionState = JSON.parse(raw) as DecompositionState;
+      // Reset daily counter if date changed
+      const today = new Date().toLocaleDateString('en-CA');
+      if (decompositionState.dailyCreationDate !== today) {
+        decompositionState.dailyCreationCount = 0;
+        decompositionState.dailyCreationDate = today;
+      }
+    } else {
+      const today = new Date().toLocaleDateString('en-CA');
+      decompositionState = {
+        decompositions: {},
+        dailyCreationCount: 0,
+        dailyCreationDate: today,
+        updatedAt: new Date().toISOString(),
+      };
+    }
+  } catch {
+    const today = new Date().toLocaleDateString('en-CA');
+    decompositionState = {
+      decompositions: {},
+      dailyCreationCount: 0,
+      dailyCreationDate: today,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  return decompositionState;
+}
+
+export function getDecompositionDepth(issueId: string): number {
+  const state = ensureDecompositionStateLoaded();
+  return state.decompositions[issueId]?.depth || 0;
+}
+
+export function getChildrenCount(issueId: string): number {
+  const state = ensureDecompositionStateLoaded();
+  return state.decompositions[issueId]?.childrenCount || 0;
+}
+
+/**
+ * Zero the counter for a new day and persist it. Lock-free: callers already
+ * hold the decomposition lock (`resetDailyCounterIfNeeded` for the public path,
+ * `reserveDailyCreations` for the reservation transaction), and the lock is not
+ * reentrant.
+ */
+function rolloverDailyCounter(state: DecompositionState): void {
+  const today = new Date().toLocaleDateString('en-CA');
+  if (state.dailyCreationDate === today) return;
+  console.log(`[DecompositionState] Daily counter reset: ${state.dailyCreationCount} → 0 (date: ${state.dailyCreationDate} → ${today})`);
+  state.dailyCreationCount = 0;
+  state.dailyCreationDate = today;
+  state.updatedAt = new Date().toISOString();
+  try {
+    ensureParentDir(DECOMPOSITION_STATE_FILE);
+    atomicWriteFileSync(DECOMPOSITION_STATE_FILE, JSON.stringify(state, null, 2));
+  } catch (err) {
+    console.warn('[DecompositionState] Failed to persist daily reset:', err);
+  }
+}
+
+function resetDailyCounterIfNeeded(): void {
+  const today = new Date().toLocaleDateString('en-CA');
+  // Fast path: this runs on every canCreateMoreIssues call, and no lock is
+  // needed when the cached date is already current. Only an actual reset takes
+  // the cross-process lock (re-checked under it) so a concurrent decomposition's
+  // count is not clobbered by a stale reset write.
+  if (ensureDecompositionStateLoaded().dailyCreationDate === today) return;
+  withFileLockSync(`${DECOMPOSITION_STATE_FILE}.lock`, () => {
+    decompositionState = null;
+    rolloverDailyCounter(ensureDecompositionStateLoaded());
+  }, { timeoutMs: 10_000 });
+}
+
+export function getDailyCreationCount(): number {
+  resetDailyCounterIfNeeded();
+  const state = ensureDecompositionStateLoaded();
+  return state.dailyCreationCount;
+}
+
+export function canCreateMoreIssues(dailyLimit: number): boolean {
+  return getDailyCreationCount() < dailyLimit;
+}
+
+/**
+ * Slots promised to in-flight decompositions but not yet created, held in the
+ * shared state file so a *second process* is refused too.
+ *
+ * A process-local counter only serialized callers inside one process. Two
+ * runners — the daemon and a CLI `openswarm run`, or two containers sharing a
+ * state directory — each read the same pre-creation count, both passed the cap
+ * check, both created external children, and the day overshot with no way to
+ * undo the issues already in the tracker. (AGT-3468)
+ *
+ * Holds are summed across holders, so two callers *inside* one process are two
+ * separate promises and both are charged — the same shape the in-process counter
+ * had.
+ */
+function heldSlots(state: DecompositionState): number {
+  return Object.values(state.reservations ?? {}).reduce((total, hold) => total + hold.count, 0);
+}
+
+/**
+ * Drop reservations whose holder is provably gone, so a crash mid-decomposition
+ * does not hold slots for the rest of the day.
+ *
+ * Reclaim needs the holder to be in OUR pid space (`isProofCapableSpace` +
+ * `sameProcessNamespace`), or its pid means nothing here. A hold from another
+ * machine — or one recorded without a namespace — is left alone: freeing a live
+ * remote owner's slots would let this process overshoot the cap its peer is
+ * still working against.
+ *
+ * Two shapes of dead holder are reclaimed:
+ *  - a pid that no longer exists, and
+ *  - a hold written before this process started but carrying OUR pid — the
+ *    pid-reuse case a container's deterministic numbering produces, where a
+ *    restarted daemon inherits its predecessor's pid and the plain liveness
+ *    probe answers "alive" against the wrong generation.
+ *
+ * A hold from a *live sibling* in this process is deliberately kept: it is a
+ * promise this process still owes, not a leak.
+ */
+function pruneDeadReservations(state: DecompositionState): boolean {
+  if (!state.reservations) return false;
+  const own = `${process.pid}:${reservationToken}`;
+  let dropped = false;
+  for (const [holderId, hold] of Object.entries(state.reservations)) {
+    if (holderId === own) continue;
+    if (!isProofCapableSpace(hold.ns ?? undefined) || !sameProcessNamespace(hold.ns ?? undefined)) continue;
+    const priorGeneration = hold.pid === process.pid
+      && Date.parse(hold.at) < PROCESS_STARTED_AT_MS - 1_000;
+    if (priorGeneration || !processAppearsAlive(hold.pid)) {
+      delete state.reservations[holderId];
+      dropped = true;
+    }
+  }
+  return dropped;
+}
+
+/** This process's own hold, which its releases draw down. */
+function ownReservation(state: DecompositionState): DecompositionReservation | undefined {
+  return state.reservations?.[`${process.pid}:${reservationToken}`];
+}
+
+/**
+ * Claim `count` slots of today's creation budget in one synchronous step, or
+ * refuse.
+ *
+ * Reading the count and acting on it cannot be split: a caller reads it, then
+ * awaits an LLM plan and several Linear round-trips before anything is
+ * registered. Fan-out runs pipelines in parallel by design, so a second run
+ * reads the same pre-creation count in that window and both overshoot the cap.
+ * (AGT-4122)
+ *
+ * The read-decide-write runs under the runner-state lock, so the two callers may
+ * be separate processes and still cannot both pass. A hold is never added to
+ * `dailyCreationCount`; `registerDecomposition` charges that for children that
+ * actually exist.
+ *
+ * Every granted reservation must be released with `releaseDailyReservation`.
+ */
+export function reserveDailyCreations(count: number, dailyLimit: number): boolean {
+  if (!Number.isInteger(count) || count <= 0 || !Number.isInteger(dailyLimit)) return false;
+  try {
+    return withRunnerStateLock(DECOMPOSITION_STATE_FILE, () => {
+      // Re-read under the lock: another process may have reserved since our last
+      // load, and the cache would answer with pre-hold numbers.
+      decompositionState = null;
+      const state = ensureDecompositionStateLoaded();
+      state.reservations ??= {};
+      const pruned = pruneDeadReservations(state);
+      rolloverDailyCounter(state);
+      if (state.dailyCreationCount + heldSlots(state) + count > dailyLimit) {
+        if (pruned) persistDecompositionState(state);
+        return false;
+      }
+      const holderId = `${process.pid}:${reservationToken}`;
+      const mine = ownReservation(state);
+      state.reservations[holderId] = {
+        pid: process.pid,
+        ns: processNamespaceId() ?? null,
+        holderId,
+        count: (mine?.count ?? 0) + count,
+        at: new Date().toISOString(),
+      };
+      persistDecompositionState(state);
+      return true;
+    });
+  } catch (error) {
+    // Failing closed is the safe direction: no reservation means the caller
+    // refuses rather than creating children against a budget it could not claim.
+    console.warn('[DecompositionState] Reservation failed:', error);
+    return false;
+  }
+}
+
+/**
+ * Drop a hold taken by `reserveDailyCreations`. `registerDecomposition` records
+ * what was actually created, so the whole reservation is released regardless of
+ * the outcome — including when the decomposition failed and created nothing.
+ */
+export function releaseDailyReservation(count: number): void {
+  if (count <= 0) return;
+  try {
+    withRunnerStateLock(DECOMPOSITION_STATE_FILE, () => {
+      decompositionState = null;
+      const state = ensureDecompositionStateLoaded();
+      const mine = ownReservation(state);
+      if (!mine) return;
+      const remaining = mine.count - count;
+      if (remaining > 0) mine.count = remaining;
+      else delete state.reservations![mine.holderId];
+      persistDecompositionState(state);
+    });
+  } catch (error) {
+    // Worst case the slots stay held until the holder is provably gone, which
+    // under-spends rather than overshooting the cap.
+    console.warn('[DecompositionState] Reservation release failed:', error);
+  }
+}
+
+/** Slots currently promised to in-flight decompositions. Test seam. */
+export function getHeldDailyCreations(): number {
+  return heldSlots(ensureDecompositionStateLoaded());
+}
+
+export function registerDecomposition(
+  issueId: string,
+  parentId: string | undefined,
+  childrenIds: string[]
+): void {
+  // Date rollover first, and outside the lock: resetDailyCounterIfNeeded takes
+  // the same lock and withFileLockSync is not reentrant.
+  resetDailyCounterIfNeeded();
+  // Both lock helpers contend on `${DECOMPOSITION_STATE_FILE}.lock`, so this
+  // still serializes against `reserveDailyCreations`. Reloading under the lock
+  // keeps every peer's reservation in the snapshot this write persists.
+  withFileLockSync(`${DECOMPOSITION_STATE_FILE}.lock`, () => {
+    // Reload under the lock: concurrent decompositions in sibling processes would
+    // otherwise each write a snapshot missing the other's child links and daily
+    // budget spend.
+    decompositionState = null;
+    const state = ensureDecompositionStateLoaded();
+    const now = new Date().toISOString();
+    const parentDepth = parentId ? (state.decompositions[parentId]?.depth ?? 0) : -1;
+    const issueDepth = parentDepth + 1;
+    const uniqueChildren = [...new Set(childrenIds)];
+    const existingChildren = new Set(
+      Object.values(state.decompositions)
+        .filter((entry) => entry.parentId === issueId)
+        .map((entry) => entry.issueId),
+    );
+
+    // Validate the full batch before mutating the in-memory projection. A child
+    // identity collision must leave no half-created parent entry behind.
+    for (const childId of uniqueChildren) {
+      const existing = state.decompositions[childId];
+      if (existing && existing.parentId !== issueId) {
+        throw new Error(`Decomposition child ${childId} is already owned by ${existing.parentId ?? 'no parent'}`);
+      }
+    }
+
+    const existingIssue = state.decompositions[issueId];
+    state.decompositions[issueId] = {
+      issueId,
+      parentId,
+      depth: issueDepth,
+      childrenCount: new Set([...existingChildren, ...uniqueChildren]).size,
+      createdAt: existingIssue?.createdAt ?? now,
+    };
+
+    let newlyRegistered = 0;
+    for (const childId of uniqueChildren) {
+      const existing = state.decompositions[childId];
+      if (!existingChildren.has(childId)) newlyRegistered++;
+      state.decompositions[childId] = {
+        issueId: childId,
+        parentId: issueId,
+        depth: issueDepth + 1,
+        childrenCount: existing?.childrenCount ?? 0,
+        createdAt: existing?.createdAt ?? now,
+      };
+    }
+
+    // Retried deterministic children do not consume the daily budget twice.
+    state.dailyCreationCount += newlyRegistered;
+    state.updatedAt = new Date().toISOString();
+
+    persistDecompositionState(state);
+  }, { timeoutMs: 10_000 });
+}
+
+// Pipeline History (persistent, time-ordered)
+
+// In-memory cache (loaded once at startup, appended per completion)
+let pipelineHistory: PipelineHistoryEntry[] | null = null;
+
+function ensureHistoryLoaded(): PipelineHistoryEntry[] {
+  if (pipelineHistory !== null) return pipelineHistory;
+  try {
+    if (existsSync(PIPELINE_HISTORY_FILE)) {
+      const raw = readFileSync(PIPELINE_HISTORY_FILE, 'utf8');
+      pipelineHistory = JSON.parse(raw) as PipelineHistoryEntry[];
+    } else {
+      pipelineHistory = [];
+    }
+  } catch {
+    pipelineHistory = [];
+  }
+  return pipelineHistory;
+}
+
+export function appendPipelineHistory(entry: PipelineHistoryEntry): void {
+  try {
+    withFileLockSync(`${PIPELINE_HISTORY_FILE}.lock`, () => {
+      // Read-modify-write against disk, not the process-local cache: a second
+      // process appending its own entry would otherwise overwrite this one.
+      let history: PipelineHistoryEntry[] = [];
+      try {
+        if (existsSync(PIPELINE_HISTORY_FILE)) {
+          const parsed = JSON.parse(readFileSync(PIPELINE_HISTORY_FILE, 'utf8')) as PipelineHistoryEntry[];
+          if (Array.isArray(parsed)) history = parsed;
+        }
+      } catch { history = []; }
+      history.unshift(entry); // newest first
+      if (history.length > MAX_PIPELINE_HISTORY) history.length = MAX_PIPELINE_HISTORY;
+      ensureParentDir(PIPELINE_HISTORY_FILE);
+      atomicWriteFileSync(PIPELINE_HISTORY_FILE, JSON.stringify(history, null, 2));
+      pipelineHistory = history;
+    }, { timeoutMs: 10_000 });
+  } catch (err) {
+    console.warn('[PipelineHistory] Failed to save:', err);
+  }
+}
+
+export function getPipelineHistory(limit = 50): PipelineHistoryEntry[] {
+  return ensureHistoryLoaded().slice(0, limit);
+}
+
+// Project Info Query (for dashboard)
+
+export interface ProjectInfo {
+  path: string;
+  name: string;
+  /** Stable tracker identity used to join a pinned repo without name guessing. */
+  linearProjectId?: string;
+  enabled: boolean;
+  running: { id: string; title: string; priority: number; issueIdentifier?: string; issueUrl?: string }[];
+  queued: { id: string; title: string; priority: number; issueIdentifier?: string; issueUrl?: string }[];
+  pending: { id: string; title: string; priority: number; issueIdentifier?: string; issueUrl?: string; linearState?: string }[];
+}
+
+type RunningEntry = { task: TaskItem; projectPath: string };
+type QueuedEntry = { task: TaskItem; projectPath: string };
+
+export function buildProjectsInfo(
+  fetchedTasks: TaskItem[],
+  running: RunningEntry[],
+  queued: QueuedEntry[],
+  pathCache: Map<string, string>,
+  enabledProjects: Set<string>,
+): ProjectInfo[] {
+  const projectMap = new Map<string, { id?: string; name: string; path: string | null; tasks: TaskItem[] }>();
+
+  for (const task of fetchedTasks) {
+    const projName = task.linearProject?.name || '(unknown)';
+    const projectKey = task.linearProject?.id || projName;
+    if (!projectMap.has(projectKey)) {
+      projectMap.set(projectKey, {
+        id: task.linearProject?.id,
+        name: projName,
+        path: pathCache.get(projName) ?? null,
+        tasks: [],
+      });
+    }
+    projectMap.get(projectKey)!.tasks.push(task);
+  }
+
+  for (const r of running) {
+    const projName = r.task.linearProject?.name || '(unknown)';
+    const projectKey = r.task.linearProject?.id || projName;
+    if (!projectMap.has(projectKey)) {
+      projectMap.set(projectKey, { id: r.task.linearProject?.id, name: projName, path: r.projectPath, tasks: [] });
+    } else if (!projectMap.get(projectKey)!.path) {
+      projectMap.get(projectKey)!.path = r.projectPath;
+    }
+  }
+  for (const q of queued) {
+    const projName = q.task.linearProject?.name || '(unknown)';
+    const projectKey = q.task.linearProject?.id || projName;
+    if (!projectMap.has(projectKey)) {
+      projectMap.set(projectKey, { id: q.task.linearProject?.id, name: projName, path: q.projectPath, tasks: [] });
+    } else if (!projectMap.get(projectKey)!.path) {
+      projectMap.get(projectKey)!.path = q.projectPath;
+    }
+  }
+
+  const activeIds = new Set([
+    ...running.map(r => r.task.issueId || r.task.id),
+    ...queued.map(q => q.task.issueId || q.task.id),
+  ]);
+
+  return Array.from(projectMap.values()).map(proj => {
+    const projectPath = proj.path ?? '';
+    const belongsToProject = (task: TaskItem): boolean => proj.id
+      ? task.linearProject?.id === proj.id
+      : (task.linearProject?.name || '(unknown)') === proj.name;
+    return {
+      path: projectPath,
+      name: proj.name,
+      ...(proj.id ? { linearProjectId: proj.id } : {}),
+      enabled: Boolean(projectPath) && isPathEnabled(projectPath, enabledProjects),
+      running: running.filter(r => belongsToProject(r.task))
+        .map(r => ({
+          id: taskEventKey(r.task), title: r.task.title, priority: r.task.priority,
+          ...(r.task.issueIdentifier ? { issueIdentifier: r.task.issueIdentifier } : {}),
+          ...(r.task.issueUrl ? { issueUrl: r.task.issueUrl } : {}),
+        })),
+      queued: queued.filter(q => belongsToProject(q.task))
+        .map(q => ({
+          id: taskEventKey(q.task), title: q.task.title, priority: q.task.priority,
+          ...(q.task.issueIdentifier ? { issueIdentifier: q.task.issueIdentifier } : {}),
+          ...(q.task.issueUrl ? { issueUrl: q.task.issueUrl } : {}),
+        })),
+      pending: proj.tasks.filter(t => !activeIds.has(t.issueId || t.id))
+        .map(t => ({
+          id: taskEventKey(t), title: t.title, priority: t.priority,
+          ...(t.issueIdentifier || t.issueId ? { issueIdentifier: t.issueIdentifier || t.issueId } : {}),
+          ...(t.issueUrl ? { issueUrl: t.issueUrl } : {}),
+          ...(t.linearState ? { linearState: t.linearState } : {}),
+        })),
+    };
+  });
+}
+
+/**
+ * Join one configured repository to the runner's tracker projection.
+ *
+ * The repository metadata project id is authoritative. Name matching remains
+ * a compatibility fallback for repositories created before openswarm.json,
+ * and is case-insensitive because directory casing is not a tracker identity.
+ */
+export function projectInfoForRepository(
+  projects: readonly ProjectInfo[],
+  input: { path: string; directoryName: string; linearProjectId?: string; linearProjectName?: string },
+): ProjectInfo | undefined {
+  if (input.linearProjectId) {
+    // A configured tracker id is authoritative. Do not fall back to a stale
+    // path/name association and accidentally display another project's tasks.
+    return projects.find((project) => project.linearProjectId === input.linearProjectId);
+  }
+
+  const byPath = projects.find((project) => project.path === input.path);
+  if (byPath) return byPath;
+
+  const expectedName = (input.linearProjectName ?? input.directoryName).toLowerCase();
+  return projects.find((project) => project.name.toLowerCase() === expectedName);
+}
+
+// Exponential Backoff for Failed Task Retries
+
+const BACKOFF_MINUTES = [10, 30, 60, 120]; // 10min, 30min, 1h, 2h
+
+/**
+ * Calculate backoff delay in milliseconds based on attempt number.
+ * @param attemptNumber - 1-indexed attempt number (1 = first failure)
+ * @returns Delay in milliseconds
+ */
+export function calculateBackoffTime(attemptNumber: number): number {
+  const index = Math.min(attemptNumber - 1, BACKOFF_MINUTES.length - 1);
+  return BACKOFF_MINUTES[index] * 60 * 1000;
+}
+
+/**
+ * Check if a task can be retried now (based on scheduled retry time).
+ * @param issueId - Issue ID to check
+ * @param retryTimes - Map of issueId → next retry timestamp
+ * @returns true if retry is allowed now, false if still in backoff period
+ */
+export function canRetryNow(issueId: string, retryTimes: Map<string, number>): boolean {
+  const nextRetryTime = retryTimes.get(issueId);
+  if (!nextRetryTime) return true; // No backoff scheduled
+  return Date.now() >= nextRetryTime;
+}
+
+/**
+ * Set next retry time for a failed task using exponential backoff.
+ * @param issueId - Issue ID
+ * @param attemptNumber - Current attempt number (1-indexed)
+ * @param retryTimes - Map to update
+ * @returns Next retry timestamp (ms)
+ */
+export function setRetryTime(
+  issueId: string,
+  attemptNumber: number,
+  retryTimes: Map<string, number>
+): number {
+  const delayMs = calculateBackoffTime(attemptNumber);
+  const nextRetryTime = Date.now() + delayMs;
+  retryTimes.set(issueId, nextRetryTime);
+  return nextRetryTime;
+}
+
+/**
+ * Clear retry time for a task (on success or manual recovery).
+ * @param issueId - Issue ID
+ * @param retryTimes - Map to update
+ */
+export function clearRetryTime(issueId: string, retryTimes: Map<string, number>): void {
+  retryTimes.delete(issueId);
+}
+
+/**
+ * Get next retry time for a task.
+ * @param issueId - Issue ID
+ * @param retryTimes - Map to query
+ * @returns Next retry timestamp (ms) or undefined if not scheduled
+ */
+export function getRetryTime(issueId: string, retryTimes: Map<string, number>): number | undefined {
+  return retryTimes.get(issueId);
+}
+
+/**
+ * Format retry time as human-readable string.
+ * @param timestamp - Timestamp in milliseconds
+ * @returns Formatted string like "in 15 minutes" or "in 2 hours"
+ */
+export function formatRetryTime(timestamp: number): string {
+  const now = Date.now();
+  const diffMs = timestamp - now;
+  if (diffMs <= 0) return 'now';
+
+  const minutes = Math.ceil(diffMs / (60 * 1000));
+  if (minutes < 60) return `in ${minutes} minute${minutes === 1 ? '' : 's'}`;
+
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  if (remainingMinutes === 0) return `in ${hours} hour${hours === 1 ? '' : 's'}`;
+  return `in ${hours}h ${remainingMinutes}m`;
+}

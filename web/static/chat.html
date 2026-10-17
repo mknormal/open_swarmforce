@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>SWARMFORGE · Chat room</title>
+  <script src="/static/js/themeBoot.js"></script>
+  <script src="/static/js/webToken.js"></script>
+  <link rel="stylesheet" href="/static/css/tokens.css" />
+  <link rel="stylesheet" href="/static/css/shell.css" />
+  <link rel="stylesheet" href="/static/css/chat.css" />
+</head>
+<body class="page-chat">
+  <header class="topbar">
+    <a class="brand" href="/app"><svg class="brand-mark" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" focusable="false"><path d="M12 2.5 20.5 7.4v9.2L12 21.5 3.5 16.6V7.4Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M12 7.8 16.2 15.4H7.8Z" fill="currentColor"/></svg><span class="brand-wordmark">SWARMFORGE</span></a>
+    <span class="page-title">Chat room</span>
+    <nav class="topbar-nav" aria-label="Pages">
+      <a href="/app">Cockpit</a>
+      <a href="/chat" aria-current="page">Chat</a>
+      <a href="/orchestration">Orchestration</a>
+      <a href="/threads">Threads</a>
+      <a href="/warehouse">Warehouse</a>
+      <a href="/usage">Usage</a>
+      <a href="/">Supervisor</a>
+    </nav>
+    <div class="topbar-spacer"></div>
+    <div class="topbar-actions">
+      <button type="button" id="theme-toggle" class="btn btn-ghost btn-icon theme-toggle" aria-label="Switch theme" aria-pressed="false">
+        <span class="when-dark" aria-hidden="true">☾</span><span class="when-light" aria-hidden="true">☀</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="chat-main">
+    <div class="room-wrap">
+      <div id="room" class="room" aria-label="Agent chat room"><div class="empty">Loading the room…</div></div>
+      <div id="drop-overlay" class="drop-overlay" hidden>Drop to attach</div>
+      <button type="button" id="scroll-latest" class="scroll-latest" hidden>↓ Latest</button>
+      <div id="room-live" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+    </div>
+
+    <form class="composer" id="composer" aria-label="Message the agents">
+      <div id="composer-files" class="composer-files" aria-label="Attached files"></div>
+      <div class="composer-row">
+        <input id="composer-file" type="file" multiple hidden aria-hidden="true" />
+        <button type="button" id="composer-attach" class="btn btn-ghost btn-icon" aria-label="Attach files" title="Attach files">📎</button>
+        <textarea id="composer-text" class="textarea composer-text" rows="1" autocomplete="off" placeholder="Loading…" aria-label="Message the agents"></textarea>
+        <button type="submit" id="composer-send" class="btn btn-primary" disabled>Send</button>
+      </div>
+      <div id="composer-status" class="status-line composer-status" role="status" aria-live="polite"></div>
+    </form>
+  </main>
+
+  <script type="module">
+    import { startChatView } from '/static/js/chatView.mjs';
+    import { installThemeToggle } from '/static/js/theme.mjs';
+    installThemeToggle(document, document.getElementById('theme-toggle'));
+    startChatView(document);
+  </script>
+</body>
+</html>

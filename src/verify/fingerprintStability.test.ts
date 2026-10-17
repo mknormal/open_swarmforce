@@ -1,0 +1,236 @@
+// INT-2961 / audit 2026-07-26 (src/verify) — the failure fingerprint has to be
+// identical for two runs of the SAME failure, because `hasSameFailure` uses it to
+// decide whether a failing command is a pre-existing failure or a regression the
+// change introduced. Two things made it differ between the base and head runs:
+//
+//   1. only the command's `cwd` was path-normalized, so with a subdirectory cwd
+//      every path outside it — sibling files, and the sandbox's isolated
+//      HOME/TMPDIR next to the project root — kept its random `mkdtemp` prefix;
+//   2. stdout and stderr were recorded into one buffer as chunks arrived, so OS
+//      scheduling decided the byte order and identical output could hash two ways.
+//
+// Both produced the same user-visible bug: a pre-existing failure reported as a
+// new regression. These tests pin the normalization contract that fixes (1); (2)
+// is structural (per-stream capture, concatenated in a fixed order) and is
+// covered by the stdout+stderr case at the bottom.
+import { describe, expect, it } from 'vitest';
+import { normalizeFailureOutput } from './runner.js';
+
+const SANDBOX_A = '/tmp/openswarm-verify-head-aaaa';
+const SANDBOX_B = '/tmp/openswarm-verify-head-bbbb';
+
+function paths(sandbox: string): Array<[string, string]> {
+  // Mirrors the call site: project root plus the isolated HOME/TMPDIR that sit
+  // beside it inside the same sandbox.
+  return [
+    [`${sandbox}/worktree`, '<PROJECT>'],
+    [`${sandbox}/home`, '<HOME>'],
+    [`${sandbox}/tmp`, '<TMP>'],
+    [sandbox, '<SANDBOX>'],
+  ];
+}
+
+describe('normalizeFailureOutput', () => {
+  it('makes two sandboxes produce identical text for the same failure', () => {
+    const failure = (sandbox: string) =>
+      [
+        `  File "${sandbox}/worktree/src/app.ts", line 3`,
+        `  imported from ${sandbox}/worktree/src/lib/util.ts`,
+        `  cache: ${sandbox}/home/.cache/build`,
+        `  scratch: ${sandbox}/tmp/pytest-0`,
+      ].join('\n');
+
+    expect(normalizeFailureOutput(failure(SANDBOX_A), paths(SANDBOX_A))).toBe(
+      normalizeFailureOutput(failure(SANDBOX_B), paths(SANDBOX_B)),
+    );
+  });
+
+  // vega-agent AGT-4118, 2026-09-02: base and head both failed collection with
+  // the same ModuleNotFoundError, but the discovered command is `pytest -q`,
+  // whose summary line has no `=` decoration, so the timing survived into the
+  // fingerprint and the pre-existing failure was reported as a new regression.
+  it('normalizes the duration on a quiet-mode pytest summary line', () => {
+    const out = (secs: string) => [
+      '==================================== ERRORS ====================================',
+      '______________ ERROR collecting tests/test_codeql_audit_scope.py _______________',
+      'E   ModuleNotFoundError: No module named \'yaml\'',
+      '=========================== short test summary info ============================',
+      'ERROR tests/test_codeql_audit_scope.py',
+      '!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!',
+      `3 skipped, 1 error in ${secs}s`,
+      '',
+    ].join('\n');
+    const a = normalizeFailureOutput(out('1.93'), paths(SANDBOX_A));
+    expect(a).toBe(normalizeFailureOutput(out('1.54'), paths(SANDBOX_B)));
+    expect(a).toContain('<N> skipped, 1 error in <DURATION>');
+    // A different count is still a different failure.
+    expect(a).not.toBe(normalizeFailureOutput(out('1.93').replace('1 error', '2 errors'), paths(SANDBOX_A)));
+  });
+
+  it('normalizes a pytest summary that carries a (H:MM:SS) suffix (AGT-4680)', () => {
+    // pytest -q adds `(0:02:04)` once a run passes a minute, which every full cgf-portal
+    // suite does. The seconds were normalised but the suffix was not, so two runs of the
+    // SAME failure on main hashed differently and read as a new regression.
+    const out = (summary: string) => [
+      '=========================== short test summary info ============================',
+      'FAILED tests/test_b5_repository.py::test_the_empty_result_has_the_same_shape_as_a_real_one',
+      '!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!',
+      summary,
+      '',
+    ].join('\n');
+    const a = normalizeFailureOutput(out('1 failed, 4234 passed, 581 skipped in 124.27s (0:02:04)'), paths(SANDBOX_A));
+    expect(a).toBe(normalizeFailureOutput(out('1 failed, 4234 passed, 581 skipped in 113.47s (0:01:53)'), paths(SANDBOX_B)));
+    expect(a).toContain('1 failed, <N> passed, <N> skipped in <DURATION>');
+    // A different count is still a different failure.
+    expect(a).not.toBe(normalizeFailureOutput(
+      out('2 failed, 4233 passed, 581 skipped in 124.27s (0:02:04)'), paths(SANDBOX_A),
+    ));
+  });
+
+  describe('failure identity, not the run transcript (AGT-4681)', () => {
+    const run = (progress: string, summary: string, failed = 'FAILED tests/test_b5.py::test_x') => [
+      progress,
+      '=================================== FAILURES ===================================',
+      '___ test_x ___',
+      'E   AssertionError: boom',
+      '=========================== short test summary info ============================',
+      failed,
+      summary,
+      '',
+    ].join('\n');
+    const norm = (text: string) => normalizeFailureOutput(text, paths(SANDBOX_A));
+    const baseline = () => norm(run('..........s...... [ 11%]', '1 failed, 4234 passed, 581 skipped in 124.27s (0:02:04)'));
+
+    it('ignores how many tests passed before the stop', () => {
+      // A worker that adds tests, or a base that gained some, moves these totals.
+      expect(norm(run('..........s...... [ 11%]', '1 failed, 4237 passed, 581 skipped in 113.47s (0:01:53)'))).toBe(baseline());
+    });
+
+    it('ignores the progress lines that precede the failure', () => {
+      expect(norm(run('..........s....... [ 12%]', '1 failed, 4234 passed, 581 skipped in 124.27s (0:02:04)'))).toBe(baseline());
+    });
+
+    it('masks the totals on a decorated summary line as well', () => {
+      const a = norm(run('', '=== 1 failed, 10 passed in 3.10s ==='));
+      expect(a).toBe(norm(run('', '=== 1 failed, 12 passed in 4.20s ===')));
+      expect(a).toContain('=== 1 failed, <N> passed in <DURATION> ===');
+    });
+
+    it('still tells a different failure apart', () => {
+      expect(norm(run('..........s...... [ 11%]', '1 failed, 4234 passed, 581 skipped in 124.27s (0:02:04)', 'FAILED tests/test_b5.py::test_y')))
+        .not.toBe(baseline());
+      expect(norm(run('..........s...... [ 11%]', '2 failed, 4233 passed, 581 skipped in 124.27s (0:02:04)'))).not.toBe(baseline());
+      expect(norm(run('..........s...... [ 11%]', '1 failed, 1 error, 4233 passed, 581 skipped in 124.27s (0:02:04)'))).not.toBe(baseline());
+    });
+  });
+
+  it('normalizes paths outside the command cwd — the subdirectory-cwd bug', () => {
+    // A command with `cwd: packages/api` fails, but the traceback points at a
+    // sibling package. Normalizing only the cwd left this line sandbox-specific.
+    const out = (s: string) => `error in ${s}/worktree/packages/web/index.ts`;
+
+    const a = normalizeFailureOutput(out(SANDBOX_A), paths(SANDBOX_A));
+
+    expect(a).toBe(normalizeFailureOutput(out(SANDBOX_B), paths(SANDBOX_B)));
+    expect(a).not.toContain('openswarm-verify-head');
+  });
+
+  it('normalizes sibling path dependencies outside the copied worktree', () => {
+    const out = (s: string) =>
+      `failed to read ${s}/intrect-plugin/crates/intrect-license/Cargo.toml`;
+
+    const a = normalizeFailureOutput(out(SANDBOX_A), paths(SANDBOX_A));
+
+    expect(a).toBe(normalizeFailureOutput(out(SANDBOX_B), paths(SANDBOX_B)));
+    expect(a).toBe('failed to read <SANDBOX>/intrect-plugin/crates/intrect-license/Cargo.toml');
+  });
+
+  it('normalizes the isolated HOME and TMPDIR, not just the project', () => {
+    const a = normalizeFailureOutput(`${SANDBOX_A}/home/.npm/_logs/x.log`, paths(SANDBOX_A));
+
+    expect(a).toBe('<HOME>/.npm/_logs/x.log');
+  });
+
+  it('substitutes the longest path first so a nested path keeps its own label', () => {
+    // '<sandbox>' contains '<sandbox>/worktree'. If the ancestor were replaced
+    // first the project label would never be reachable.
+    const withAncestor: Array<[string, string]> = [
+      [SANDBOX_A, '<SANDBOX>'],
+      [`${SANDBOX_A}/worktree`, '<PROJECT>'],
+    ];
+
+    const out = normalizeFailureOutput(`${SANDBOX_A}/worktree/src/a.ts`, withAncestor);
+
+    expect(out).toBe('<PROJECT>/src/a.ts');
+  });
+
+  it('treats regex metacharacters in a path literally', () => {
+    const weird = '/tmp/build (1)+test';
+
+    const out = normalizeFailureOutput(`${weird}/src/a.ts`, [[weird, '<PROJECT>']]);
+
+    expect(out).toBe('<PROJECT>/src/a.ts');
+  });
+
+  it('ignores empty paths instead of matching everywhere', () => {
+    // An empty needle would otherwise splice the label between every character.
+    expect(normalizeFailureOutput('abc', [['', '<X>']])).toBe('abc');
+  });
+
+  it('still strips ANSI colour and run durations', () => {
+    const esc = String.fromCharCode(27);
+
+    const out = normalizeFailureOutput(
+      `${esc}[31mFAIL${esc}[0m\n=== 1 failed in 4.21s ===\nRan 3 tests in 0.09s\nfinished in 2.5s`,
+      [],
+    );
+
+    expect(out).not.toContain(esc);
+    expect(out).toContain('<DURATION>');
+    expect(out).not.toContain('4.21s');
+    expect(out).not.toContain('0.09s');
+    expect(out).not.toContain('2.5s');
+  });
+
+  it('normalizes pytest-xdist worker assignment and failure completion order', () => {
+    const a = [
+      '============================= FAILURES =============================',
+      '____________________ test_a ____________________',
+      '[gw1] linux',
+      'E   AssertionError: old failure',
+      '____________________ test_b ____________________',
+      '[gw2] linux',
+      'E   AssertionError: other old failure',
+      '=========================== short test summary info ============================',
+      'FAILED tests/test_b.py::test_b',
+      'FAILED tests/test_a.py::test_a',
+    ].join('\n');
+    const b = [
+      '============================= FAILURES =============================',
+      '____________________ test_b ____________________',
+      '[gw7] linux',
+      'E   AssertionError: other old failure',
+      '____________________ test_a ____________________',
+      '[gw3] linux',
+      'E   AssertionError: old failure',
+      '=========================== short test summary info ============================',
+      'FAILED tests/test_a.py::test_a',
+      'FAILED tests/test_b.py::test_b',
+    ].join('\n');
+
+    expect(normalizeFailureOutput(a, [])).toBe(normalizeFailureOutput(b, []));
+  });
+
+  it('is stable for output that mixes stdout and stderr content', () => {
+    // The fingerprint is now built stdout-then-stderr rather than in arrival
+    // order, so the two streams' relative timing cannot change the hash input.
+    // Here the same logical content is normalized from both orderings.
+    const stdout = `running ${SANDBOX_A}/worktree/src/a.ts\n`;
+    const stderr = `error: ${SANDBOX_A}/worktree/src/b.ts\n`;
+
+    const fixedOrder = normalizeFailureOutput(stdout + stderr, paths(SANDBOX_A));
+
+    expect(fixedOrder).toBe('running <PROJECT>/src/a.ts\nerror: <PROJECT>/src/b.ts\n');
+    expect(fixedOrder).not.toContain('openswarm-verify-head');
+  });
+});
